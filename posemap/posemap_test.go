@@ -576,7 +576,7 @@ func TestCorruptAndVersion(t *testing.T) {
 	// 支持的版本可以打开；构造一个 CRC 合法但版本号不受支持的文件。
 	raw := append([]byte(nil), good...)
 	raw[8] = 0x00
-	raw[9] = 0x02 // version 2
+	raw[9] = 0x03 // version 3（本包仅支持 1 和 2）
 	// 重算 CRC。
 	sum := crc32.ChecksumIEEE(raw[:len(raw)-4])
 	binary.BigEndian.PutUint32(raw[len(raw)-4:], sum)

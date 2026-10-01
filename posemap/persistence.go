@@ -24,16 +24,18 @@ import (
 // 覆盖（Create 用 O_EXCL，Open 只读取证）。
 const (
 	fileMagic   = "POSEMAP1"
-	fileVersion = uint16(1)
+	fileVersion = uint16(2)
 	headerLen   = 8 + 2 + 4
 )
 
 type fileData struct {
-	Version    int            `json:"version"`
-	Config     Config         `json:"config"`
-	Trajectory []Pose         `json:"trajectory"`
-	Landmarks  []landmarkJSON `json:"landmarks"`
-	Segments   []segmentJSON  `json:"segments"`
+	Version           int                `json:"version"`
+	Config            Config             `json:"config"`
+	Trajectory        []Pose             `json:"trajectory"`
+	Landmarks         []landmarkJSON     `json:"landmarks"`
+	Segments          []segmentJSON      `json:"segments"`
+	FrameObservations [][]Observation    `json:"frame_observations"`
+	Corrections       []CorrectionRecord `json:"corrections"`
 }
 
 type landmarkJSON struct {
@@ -52,11 +54,13 @@ type segmentJSON struct {
 // encodeFile 把内存状态编码为完整文件字节。
 func encodeFile(st *mapState) ([]byte, error) {
 	fd := fileData{
-		Version:    int(fileVersion),
-		Config:     st.config,
-		Trajectory: st.trajectory,
-		Landmarks:  make([]landmarkJSON, 0, len(st.landmarks)),
-		Segments:   make([]segmentJSON, 0, len(st.segments)),
+		Version:           int(fileVersion),
+		Config:            st.config,
+		Trajectory:        st.trajectory,
+		Landmarks:         make([]landmarkJSON, 0, len(st.landmarks)),
+		Segments:          make([]segmentJSON, 0, len(st.segments)),
+		FrameObservations: st.observations,
+		Corrections:       st.corrections,
 	}
 	for id, lm := range st.landmarks {
 		fd.Landmarks = append(fd.Landmarks, landmarkJSON{ID: id, X: lm.x, Y: lm.y, Count: lm.count})
@@ -89,7 +93,7 @@ func loadFile(path string) (*mapState, error) {
 		return nil, fmt.Errorf("%w: unrecognized header", ErrCorrupt)
 	}
 	version := binary.BigEndian.Uint16(raw[8:10])
-	if version != fileVersion {
+	if version != 1 && version != fileVersion {
 		return nil, fmt.Errorf("%w: version %d", ErrUnsupportedVersion, version)
 	}
 	length := binary.BigEndian.Uint32(raw[10:14])
@@ -105,7 +109,7 @@ func loadFile(path string) (*mapState, error) {
 	if err := json.Unmarshal(raw[headerLen:headerLen+int(length)], &fd); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	if err := validateLoaded(&fd); err != nil {
+	if err := validateLoaded(&fd, version); err != nil {
 		return nil, err
 	}
 
@@ -128,13 +132,28 @@ func loadFile(path string) (*mapState, error) {
 			result: ImportResult{EndPose: sg.Result.EndPose, LandmarkIDs: ids},
 		}
 	}
+	if version == 1 {
+		// 旧版文件没有逐帧观测来源：全部条目标记为未知（nil），
+		// 涉及这些帧的校正将因缺少依据被拒绝。
+		st.observations = make([][]Observation, len(st.trajectory))
+		st.corrections = nil
+	} else {
+		st.observations = fd.FrameObservations
+		if st.observations == nil {
+			st.observations = make([][]Observation, len(st.trajectory))
+		}
+		st.corrections = fd.Corrections
+		if st.corrections == nil {
+			st.corrections = []CorrectionRecord{}
+		}
+	}
 	return st, nil
 }
 
 // validateLoaded 对解码后的状态做基本不变量检查，违背即视为损坏。
-func validateLoaded(fd *fileData) error {
+func validateLoaded(fd *fileData, version uint16) error {
 	switch {
-	case fd.Version != int(fileVersion):
+	case fd.Version != int(version):
 		return fmt.Errorf("%w: version %d in payload", ErrUnsupportedVersion, fd.Version)
 	case len(fd.Trajectory) == 0:
 		return fmt.Errorf("%w: empty trajectory", ErrCorrupt)
@@ -162,6 +181,36 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: duplicate segment %s", ErrCorrupt, sg.ID)
 		}
 		segIDs[sg.ID] = struct{}{}
+	}
+	if version == fileVersion {
+		if err := validateCorrections(fd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateCorrections 校验 v2 文件中的校正记录结构基本完整。
+func validateCorrections(fd *fileData) error {
+	times := make(map[int64]struct{}, len(fd.Trajectory))
+	for _, p := range fd.Trajectory {
+		times[p.Time] = struct{}{}
+	}
+	corrIDs := make(map[string]struct{}, len(fd.Corrections))
+	for _, rec := range fd.Corrections {
+		if rec.ID == "" {
+			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
+		}
+		if _, dup := corrIDs[rec.ID]; dup {
+			return fmt.Errorf("%w: duplicate correction %s", ErrCorrupt, rec.ID)
+		}
+		corrIDs[rec.ID] = struct{}{}
+		if _, ok := times[rec.AnchorTime]; !ok {
+			return fmt.Errorf("%w: correction anchor not found", ErrCorrupt)
+		}
+		if len(rec.Poses) == 0 || rec.Poses[0].Time != rec.AnchorTime || rec.Poses[len(rec.Poses)-1].Time != rec.EndTime {
+			return fmt.Errorf("%w: invalid correction poses", ErrCorrupt)
+		}
 	}
 	return nil
 }

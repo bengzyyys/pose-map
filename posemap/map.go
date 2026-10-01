@@ -19,10 +19,13 @@ type Map struct {
 
 // mapState 是地图的全部内存状态。
 type mapState struct {
-	config     Config
-	trajectory []Pose // 按时间严格递增；trajectory[0] 为初始位姿
-	landmarks  map[string]*landmarkState
-	segments   map[string]*segmentRecord
+	config       Config
+	trajectory   []Pose // 按时间严格递增；trajectory[0] 为初始位姿
+	landmarks    map[string]*landmarkState
+	segments     map[string]*segmentRecord
+	observations [][]Observation // 与 trajectory 平行；observations[i] 为第 i 帧的逐帧观测来源
+	// （nil 条目表示该帧来源未知——旧版文件导入的帧；非 nil 空切片表示该帧无观测且来源完整）
+	corrections []CorrectionRecord // 按提交次序留档的成功校正记录
 }
 
 // landmarkState 是路标在地图坐标下的聚合状态。
@@ -53,10 +56,12 @@ func Create(path string, cfg Config) (*Map, error) {
 		return nil, err
 	}
 	st := &mapState{
-		config:     cfg,
-		trajectory: []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
-		landmarks:  make(map[string]*landmarkState),
-		segments:   make(map[string]*segmentRecord),
+		config:       cfg,
+		trajectory:   []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
+		landmarks:    make(map[string]*landmarkState),
+		segments:     make(map[string]*segmentRecord),
+		observations: [][]Observation{{}}, // 初始位姿无观测，但来源完整（已知为零观测）
+		corrections:  nil,
 	}
 	m := &Map{path: path, state: st}
 	// O_EXCL：目标已存在即失败，绝不当作新地图覆盖。
@@ -225,6 +230,7 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 
 	// ---- 全部校验通过：提交内存状态并落盘；落盘失败精确回滚 ----
 	trajLenBefore := len(st.trajectory)
+	obsLenBefore := len(st.observations)
 	type undoLandmark struct {
 		lm *landmarkState
 		ok bool
@@ -236,10 +242,21 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		st.landmarks[id] = nl
 	}
 	st.trajectory = append(st.trajectory, newPoses...)
+	// 逐帧观测来源与轨迹平行保存，供日后回环校正重放；零观测帧存非 nil 空切片。
+	newObs := make([][]Observation, 0, len(seg.Frames))
+	for _, f := range seg.Frames {
+		obs := f.Observations
+		if obs == nil {
+			obs = []Observation{}
+		}
+		newObs = append(newObs, obs)
+	}
+	st.observations = append(st.observations, newObs...)
 	st.segments[seg.ID] = &segmentRecord{hash: canonicalHash(seg.Frames), result: cloneResult(res)}
 
 	if err := m.saveReplace(); err != nil {
 		st.trajectory = st.trajectory[:trajLenBefore]
+		st.observations = st.observations[:obsLenBefore]
 		for id, u := range undo {
 			if u.ok {
 				st.landmarks[id] = u.lm
@@ -324,4 +341,261 @@ func AsRejectError(err error) (*RejectError, bool) {
 		return r, true
 	}
 	return nil, false
+}
+
+// CorrectLoop 应用一次“已确认回环”校正：锚点帧（必须精确命中已导入帧，
+// 且不得为初始位姿）采用提交的目标位姿；从锚点到提交时末帧的轨迹整体
+// 平移加旋转，保持这些帧在校正前彼此的相对位置与朝向，时间不变，朝向
+// 沿用归一范围；锚点之后每帧的方差等于目标方差加锚点之后至该帧的原
+// 运动方差累计值。受影响帧的路标观测随位姿改变地图位置，更早观测的
+// 地图位置不变；同一路标仍按全部已接受观测取平均，标识与观测次数不
+// 变。校正后的观测仍按原时间与同帧输入次序遵守合并距离限制，冲突则
+// 整次拒绝。
+//
+// 整次校正要么全部生效（含落盘），要么因可区分的 *RejectError 被整次
+// 拒绝，此前已提交的位姿、路标、校正记录不受影响，查询看不到部分更
+// 新。同一校正标识再次以相同内容提交时直接返回首次结果且不改变数据；
+// 同一标识对应不同内容则以 RejectCorrectionDuplicateMismatch 拒绝。
+func (m *Map) CorrectLoop(lc LoopCorrection) (CorrectionRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return CorrectionRecord{}, ErrClosed
+	}
+	st := m.state
+
+	// 校正标识非空。
+	if lc.ID == "" {
+		return CorrectionRecord{}, &RejectError{Kind: RejectEmptyCorrectionID}
+	}
+
+	// 已保存校正：相同内容直接返回首次结果；不同内容明确拒绝。
+	if dup := findCorrection(st.corrections, lc.ID); dup != nil {
+		if sameCorrectionContent(dup, lc) {
+			return cloneCorrectionRecord(*dup), nil
+		}
+		return CorrectionRecord{}, &RejectError{Kind: RejectCorrectionDuplicateMismatch, Landmark: lc.ID, HasLandmark: true}
+	}
+
+	// 目标数值有限、方差非负。
+	if !isFinite(lc.X) || !isFinite(lc.Y) || !isFinite(lc.Heading) || !isFinite(lc.Variance) {
+		return CorrectionRecord{}, &RejectError{Kind: RejectCorrectionNonFinite}
+	}
+	if lc.Variance < 0 {
+		return CorrectionRecord{}, &RejectError{Kind: RejectNegativeTargetVariance}
+	}
+
+	// 锚点：必须精确命中已导入帧，且不得为初始位姿。
+	anchorIdx := -1
+	for i := range st.trajectory {
+		if st.trajectory[i].Time == lc.AnchorTime {
+			anchorIdx = i
+			break
+		}
+	}
+	if anchorIdx < 1 { // 未命中或命中初始位姿（trajectory[0]）
+		return CorrectionRecord{}, &RejectError{Kind: RejectAnchorNotFound}
+	}
+	endIdx := len(st.trajectory) - 1
+
+	// 受影响范围 [anchorIdx, endIdx] 必须具备完整逐帧观测依据。
+	if len(st.observations) != len(st.trajectory) {
+		return CorrectionRecord{}, &RejectError{Kind: RejectIncompleteBasis}
+	}
+	for i := anchorIdx; i <= endIdx; i++ {
+		if st.observations[i] == nil {
+			return CorrectionRecord{}, &RejectError{Kind: RejectIncompleteBasis}
+		}
+	}
+
+	// ---- 计算校正后位姿（暂存在 newPoses，真实状态此时不变）----
+	oldAnchor := st.trajectory[anchorIdx]
+	targetHeading := normalizeAngle(lc.Heading)
+	theta := normalizeAngle(targetHeading - oldAnchor.Heading)
+	cosT, sinT := math.Cos(theta), math.Sin(theta)
+	// 旋转 R(theta) 加平移 t，使旧锚点映射到目标位姿。
+	tx := lc.X - (cosT*oldAnchor.X - sinT*oldAnchor.Y)
+	ty := lc.Y - (sinT*oldAnchor.X + cosT*oldAnchor.Y)
+
+	newPoses := make([]Pose, len(st.trajectory))
+	copy(newPoses, st.trajectory)
+	newPoses[anchorIdx] = Pose{Time: oldAnchor.Time, X: lc.X, Y: lc.Y, Heading: targetHeading, Variance: lc.Variance}
+	for i := anchorIdx + 1; i <= endIdx; i++ {
+		p := st.trajectory[i]
+		nx := cosT*p.X - sinT*p.Y + tx
+		ny := sinT*p.X + cosT*p.Y + ty
+		nh := normalizeAngle(p.Heading + theta)
+		// 锚点之后每帧方差 = 目标方差 + 锚点至该帧的原运动方差累计。
+		nv := lc.Variance + (p.Variance - oldAnchor.Variance)
+		if !isFinite(nx) || !isFinite(ny) || !isFinite(nh) || !isFinite(nv) {
+			return CorrectionRecord{}, &RejectError{Kind: RejectCorrectionNonFinite}
+		}
+		newPoses[i] = Pose{Time: p.Time, X: nx, Y: ny, Heading: nh, Variance: nv}
+	}
+
+	// ---- 重放受影响路标：先按旧位姿扣减受影响观测，再按校正后位姿按原次序重放 ----
+	affectedIDs := make(map[string]struct{})
+	for i := anchorIdx; i <= endIdx; i++ {
+		for _, ob := range st.observations[i] {
+			affectedIDs[ob.ID] = struct{}{}
+		}
+	}
+	newLandmarks := make(map[string]*landmarkState, len(st.landmarks))
+	for id, lm := range st.landmarks {
+		cp := *lm
+		newLandmarks[id] = &cp
+	}
+
+	affectedList := make([]string, 0, len(affectedIDs))
+	for id := range affectedIDs {
+		affectedList = append(affectedList, id)
+	}
+	sort.Strings(affectedList)
+
+	for _, id := range affectedList {
+		cur := st.landmarks[id]
+		// 收集 [anchorIdx, endIdx] 内该路标的观测，按帧次序、同帧输入次序。
+		var postObs []frameObs
+		for i := anchorIdx; i <= endIdx; i++ {
+			for _, ob := range st.observations[i] {
+				if ob.ID == id {
+					postObs = append(postObs, frameObs{frameIdx: i, ob: ob})
+				}
+			}
+		}
+		// 用旧位姿计算这些观测的地图坐标和，从当前聚合中扣减，得到锚点前聚合。
+		var sumPostX, sumPostY float64
+		for _, po := range postObs {
+			p := st.trajectory[po.frameIdx]
+			mx, my := localToMap(p.X, p.Y, p.Heading, po.ob.X, po.ob.Y)
+			sumPostX += mx
+			sumPostY += my
+		}
+		preCount := cur.count - len(postObs)
+		preSumX := cur.x*float64(cur.count) - sumPostX
+		preSumY := cur.y*float64(cur.count) - sumPostY
+
+		var aggX, aggY float64
+		var aggCount int
+		if preCount > 0 {
+			aggX = preSumX / float64(preCount)
+			aggY = preSumY / float64(preCount)
+			aggCount = preCount
+		}
+
+		// 按校正后位姿重放，仍按原时间与同帧输入次序遵守合并距离限制。
+		for _, po := range postObs {
+			p := newPoses[po.frameIdx]
+			mx, my := localToMap(p.X, p.Y, p.Heading, po.ob.X, po.ob.Y)
+			if !isFinite(mx) || !isFinite(my) {
+				return CorrectionRecord{}, &RejectError{Kind: RejectCorrectionNonFinite, Landmark: id, HasLandmark: true}
+			}
+			if aggCount > 0 {
+				if math.Hypot(mx-aggX, my-aggY) > st.config.MergeDistance {
+					return CorrectionRecord{}, &RejectError{
+						Kind: RejectLandmarkConflict, Frame: po.frameIdx, HasFrame: true,
+						FrameTime: p.Time, HasFrameTime: true, Landmark: id, HasLandmark: true,
+					}
+				}
+				aggX = (aggX*float64(aggCount) + mx) / float64(aggCount+1)
+				aggY = (aggY*float64(aggCount) + my) / float64(aggCount+1)
+				aggCount++
+			} else {
+				aggX, aggY, aggCount = mx, my, 1
+			}
+		}
+		newLandmarks[id] = &landmarkState{x: aggX, y: aggY, count: aggCount}
+	}
+
+	// ---- 组装留档（含受影响位姿与路标的校正前后值）----
+	rec := CorrectionRecord{
+		ID:         lc.ID,
+		AnchorTime: lc.AnchorTime,
+		Target:     Pose{Time: oldAnchor.Time, X: lc.X, Y: lc.Y, Heading: targetHeading, Variance: lc.Variance},
+		EndTime:    st.trajectory[endIdx].Time,
+	}
+	for i := anchorIdx; i <= endIdx; i++ {
+		rec.Poses = append(rec.Poses, CorrectedPose{
+			Time:   st.trajectory[i].Time,
+			Before: st.trajectory[i],
+			After:  newPoses[i],
+		})
+	}
+	for _, id := range affectedList {
+		before := st.landmarks[id]
+		after := newLandmarks[id]
+		rec.Landmarks = append(rec.Landmarks, CorrectedLandmark{
+			ID:     id,
+			Before: Landmark{ID: id, X: before.x, Y: before.y, Count: before.count},
+			After:  Landmark{ID: id, X: after.x, Y: after.y, Count: after.count},
+		})
+	}
+
+	// ---- 提交内存状态并落盘；落盘失败精确回滚 ----
+	oldTraj := st.trajectory
+	oldLMs := st.landmarks
+	corrLenBefore := len(st.corrections)
+	st.trajectory = newPoses
+	st.landmarks = newLandmarks
+	st.corrections = append(st.corrections, rec)
+
+	if err := m.saveReplace(); err != nil {
+		st.trajectory = oldTraj
+		st.landmarks = oldLMs
+		st.corrections = st.corrections[:corrLenBefore]
+		return CorrectionRecord{}, err
+	}
+	return cloneCorrectionRecord(rec), nil
+}
+
+// Corrections 返回按提交次序留档的成功校正记录。
+func (m *Map) Corrections() ([]CorrectionRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, ErrClosed
+	}
+	out := make([]CorrectionRecord, len(m.state.corrections))
+	for i, rec := range m.state.corrections {
+		out[i] = cloneCorrectionRecord(rec)
+	}
+	return out, nil
+}
+
+// frameObs 是重放路标时的一条观测：所在轨迹帧序号与观测内容。
+type frameObs struct {
+	frameIdx int
+	ob       Observation
+}
+
+// findCorrection 返回已保存的同标识校正记录，不存在返回 nil。
+func findCorrection(recs []CorrectionRecord, id string) *CorrectionRecord {
+	for i := range recs {
+		if recs[i].ID == id {
+			return &recs[i]
+		}
+	}
+	return nil
+}
+
+// sameCorrectionContent 判断两次校正提交的内容（锚点时间与目标位姿）是否相同。
+func sameCorrectionContent(rec *CorrectionRecord, lc LoopCorrection) bool {
+	return rec.AnchorTime == lc.AnchorTime &&
+		rec.Target.X == lc.X && rec.Target.Y == lc.Y &&
+		rec.Target.Heading == lc.Heading && rec.Target.Variance == lc.Variance
+}
+
+// cloneCorrectionRecord 深拷贝校正记录的切片字段。
+func cloneCorrectionRecord(rec CorrectionRecord) CorrectionRecord {
+	if rec.Poses != nil {
+		cp := make([]CorrectedPose, len(rec.Poses))
+		copy(cp, rec.Poses)
+		rec.Poses = cp
+	}
+	if rec.Landmarks != nil {
+		cp := make([]CorrectedLandmark, len(rec.Landmarks))
+		copy(cp, rec.Landmarks)
+		rec.Landmarks = cp
+	}
+	return rec
 }
