@@ -1,6 +1,8 @@
 package posemap
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -19,13 +21,14 @@ type Map struct {
 
 // mapState 是地图的全部内存状态。
 type mapState struct {
-	config      Config
-	trajectory  []Pose // 按时间严格递增；trajectory[0] 为初始位姿
-	landmarks   map[string]*landmarkState
-	segments    map[string]*segmentRecord
-	sources     []*frameSource // sources[k] 对应 trajectory[k+1]；长度恒为 len(trajectory)-1
-	corrections []*CorrectionRecord
-	corrIndex   map[string]string // 校正标识 -> 首次内容指纹
+	config        Config
+	trajectory    []Pose // 按时间严格递增；trajectory[0] 为初始位姿
+	landmarks     map[string]*landmarkState
+	segments      map[string]*segmentRecord
+	sources       []*frameSource // sources[k] 对应 trajectory[k+1]；长度恒为 len(trajectory)-1
+	corrections   []*CorrectionRecord
+	corrIndex     map[string]string              // 校正标识 -> 首次内容指纹
+	invalidations map[string]*invalidationRecord // 失效操作标识 -> 首次记录
 }
 
 // frameSource 是生成某一帧的原始输入，供回环校正重放路标观测与累计
@@ -36,19 +39,81 @@ type frameSource struct {
 	observations []Observation
 }
 
-// landmarkState 是路标在地图坐标下的聚合状态。
+// landmarkState 是路标在地图坐标下的聚合状态，按出现次数组织。
 //
-// legacy* 只用于打开不携带逐帧观测来源的旧文件：旧文件中每一帧的观测
-// 无法重放，因此旧文件里该路标的全部观测贡献视为固定的 legacyCount 次
-// 平均，不随后续校正改变；旧文件之后新导入且依据完整的观测再做增量
-// 平均。由本版本创建/导入的路标 legacyCount 为 0，全部观测均可重放。
+// 同一标识首次出现编号为 1，每次失效后在新的成功导入轨迹中再次出现时
+// 编号递增。各次出现独立聚合：旧记录不参与新记录的合并，校正时各次出现
+// 分别重放观测并遵守合并距离限制。
+//
+// legacy* 只用于打开不携带逐帧观测来源的旧文件，存于首次出现记录：旧文件
+// 中该路标的全部观测贡献视为固定的 legacyCount 次平均，不随后续校正改变；
+// 旧文件之后新导入且依据完整的观测再做增量平均。
 type landmarkState struct {
-	x           float64
-	y           float64
-	count       int
-	legacyCount int
-	legacyMX    float64
-	legacyMY    float64
+	appearances []*landmarkAppearance
+}
+
+// landmarkAppearance 是路标的一次出现记录。
+type landmarkAppearance struct {
+	number        int
+	x, y          float64
+	count         int
+	valid         bool
+	firstTime     int64 // 首次观测时间；旧文件缺少来源时为 -1
+	invalidTime   int64
+	invalidReason string
+	legacyCount   int
+	legacyMX      float64
+	legacyMY      float64
+}
+
+// currentValid 返回当前有效的出现记录；没有则返回 nil。
+func (lm *landmarkState) currentValid() *landmarkAppearance {
+	if lm == nil || len(lm.appearances) == 0 {
+		return nil
+	}
+	last := lm.appearances[len(lm.appearances)-1]
+	if last.valid {
+		return last
+	}
+	return nil
+}
+
+// appearanceByNumber 返回指定编号的出现记录；不存在返回 nil。
+func (lm *landmarkState) appearanceByNumber(n int) *landmarkAppearance {
+	if lm == nil {
+		return nil
+	}
+	for _, a := range lm.appearances {
+		if a.number == n {
+			return a
+		}
+	}
+	return nil
+}
+
+// appearanceAt 返回帧时间 t 所属的出现记录索引；不属任何出现返回 -1。
+// 旧文件首次记录 firstTime=-1，覆盖下一次出现之前的全部帧。
+func (lm *landmarkState) appearanceAt(t int64) int {
+	if lm == nil {
+		return -1
+	}
+	idx := -1
+	for i, a := range lm.appearances {
+		if a.firstTime <= t {
+			idx = i
+		} else {
+			break
+		}
+	}
+	return idx
+}
+
+// invalidationRecord 记录一次已成功保存的失效操作：原因、路标集合与
+// 首次结果，供相同内容重复提交时直接返回。
+type invalidationRecord struct {
+	reason      string
+	landmarkIDs []string // 已排序，便于比较集合
+	result      InvalidateResult
 }
 
 // segmentRecord 记录一个已成功保存的段：内容指纹与首次导入结果，
@@ -72,11 +137,12 @@ func Create(path string, cfg Config) (*Map, error) {
 		return nil, err
 	}
 	st := &mapState{
-		config:     cfg,
-		trajectory: []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
-		landmarks:  make(map[string]*landmarkState),
-		segments:   make(map[string]*segmentRecord),
-		corrIndex:  make(map[string]string),
+		config:        cfg,
+		trajectory:    []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
+		landmarks:     make(map[string]*landmarkState),
+		segments:      make(map[string]*segmentRecord),
+		corrIndex:     make(map[string]string),
+		invalidations: make(map[string]*invalidationRecord),
 	}
 	m := &Map{path: path, state: st}
 	// O_EXCL：目标已存在即失败，绝不当作新地图覆盖。
@@ -214,20 +280,41 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 			if lm == nil {
 				lm = st.landmarks[ob.ID]
 				if lm != nil {
-					// 复制已提交路标，避免提前修改真实状态。
-					cp := *lm
-					lm = &cp
+					// 复制已提交路标（含各次出现），避免提前修改真实状态。
+					cp := &landmarkState{}
+					cp.appearances = make([]*landmarkAppearance, len(lm.appearances))
+					for k, a := range lm.appearances {
+						acp := *a
+						cp.appearances[k] = &acp
+					}
+					lm = cp
 				}
 			}
-			if lm != nil {
-				if math.Hypot(mx-lm.x, my-lm.y) > m.state.config.MergeDistance {
+			if a := lm.currentValid(); a != nil {
+				// 已有当前有效记录：沿用合并距离限制并增量平均。
+				if math.Hypot(mx-a.x, my-a.y) > m.state.config.MergeDistance {
 					return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
 				}
-				lm.x = (lm.x*float64(lm.count) + mx) / float64(lm.count+1)
-				lm.y = (lm.y*float64(lm.count) + my) / float64(lm.count+1)
-				lm.count++
+				a.x = (a.x*float64(a.count) + mx) / float64(a.count+1)
+				a.y = (a.y*float64(a.count) + my) / float64(a.count+1)
+				a.count++
 			} else {
-				lm = &landmarkState{x: mx, y: my, count: 1}
+				// 无当前有效记录（首次出现或失效后再次出现）：新建一次出现，
+				// 位置来自首次新观测，观测计数从 1 开始，旧记录不参加合并。
+				num := 1
+				if lm != nil && len(lm.appearances) > 0 {
+					num = lm.appearances[len(lm.appearances)-1].number + 1
+				} else {
+					lm = &landmarkState{}
+				}
+				lm.appearances = append(lm.appearances, &landmarkAppearance{
+					number:    num,
+					x:         mx,
+					y:         my,
+					count:     1,
+					valid:     true,
+					firstTime: f.Time,
+				})
 			}
 			staged[ob.ID] = lm
 			touched[ob.ID] = struct{}{}
@@ -337,8 +424,12 @@ func (m *Map) LandmarksInRect(r Rect) ([]Landmark, error) {
 	}
 	var out []Landmark
 	for id, lm := range m.state.landmarks {
-		if lm.x >= r.MinX && lm.x <= r.MaxX && lm.y >= r.MinY && lm.y <= r.MaxY {
-			out = append(out, Landmark{ID: id, X: lm.x, Y: lm.y, Count: lm.count})
+		a := lm.currentValid()
+		if a == nil {
+			continue // 无当前有效记录：区域查询不展示
+		}
+		if a.x >= r.MinX && a.x <= r.MaxX && a.y >= r.MinY && a.y <= r.MaxY {
+			out = append(out, Landmark{ID: id, X: a.x, Y: a.y, Count: a.count})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -346,6 +437,179 @@ func (m *Map) LandmarksInRect(r Rect) ([]Landmark, error) {
 		out = []Landmark{}
 	}
 	return out, nil
+}
+
+// LandmarkHistory 返回指定标识的全部出现记录，按编号递增排列。未知标识
+// 返回 ErrNotFound。未失效的出现记录中 InvalidTime 与 InvalidReason 为
+// 零值，FirstTime 为 -1 表示首次观测时间未知（旧文件缺少来源）。
+func (m *Map) LandmarkHistory(id string) (LandmarkRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return LandmarkRecord{}, ErrClosed
+	}
+	lm := m.state.landmarks[id]
+	if lm == nil {
+		return LandmarkRecord{}, ErrNotFound
+	}
+	out := LandmarkRecord{ID: id, Appearances: make([]LandmarkAppearance, 0, len(lm.appearances))}
+	for _, a := range lm.appearances {
+		out.Appearances = append(out.Appearances, LandmarkAppearance{
+			Number:        a.number,
+			X:             a.x,
+			Y:             a.y,
+			Count:         a.count,
+			Valid:         a.valid,
+			FirstTime:     a.firstTime,
+			InvalidTime:   a.invalidTime,
+			InvalidReason: a.invalidReason,
+		})
+	}
+	return out, nil
+}
+
+// Invalidate 提交一次路标失效请求。
+//
+// 操作标识与原因必须非空，路标列表必须非空且不含空标识或重复标识；路标
+// 必须存在且当前有效。全部校验通过后，对这些路标的当前有效记录同时生效，
+// 失效时间为提交时的当前位姿时间，返回失效时间和各路标的出现编号。区域
+// 查询立即排除这些路标，位姿与已接受的观测不被删除。
+//
+// 同一失效操作标识以相同原因、相同路标集合重复提交返回首次结果，即使
+// 路标后来再次出现也不再撤下；同一标识不同内容明确拒绝。任何拒绝或保存
+// 失败都不留下部分变化。
+func (m *Map) Invalidate(req InvalidateRequest) (InvalidateResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return InvalidateResult{}, ErrClosed
+	}
+	st := m.state
+
+	// 已保存失效操作：相同内容直接返回首次结果；不同内容明确拒绝。
+	if rec, ok := st.invalidations[req.ID]; ok {
+		if canonicalInvalidationHash(req.Reason, req.LandmarkIDs) == canonicalInvalidationHash(rec.reason, rec.landmarkIDs) {
+			return cloneInvalidateResult(rec.result), nil
+		}
+		return InvalidateResult{}, &RejectError{Kind: RejectInvalidationMismatch, Landmark: req.ID, HasLandmark: true}
+	}
+
+	if req.ID == "" {
+		return InvalidateResult{}, &RejectError{Kind: RejectEmptyID}
+	}
+	if req.Reason == "" {
+		return InvalidateResult{}, &RejectError{Kind: RejectEmptyReason}
+	}
+	if len(req.LandmarkIDs) == 0 {
+		return InvalidateResult{}, &RejectError{Kind: RejectEmptyLandmarkList}
+	}
+
+	// 校验列表：无空标识、无重复。
+	seen := make(map[string]struct{}, len(req.LandmarkIDs))
+	dups := make([]string, 0)
+	for _, id := range req.LandmarkIDs {
+		if id == "" {
+			return InvalidateResult{}, &RejectError{Kind: RejectEmptyID}
+		}
+		if _, ok := seen[id]; ok {
+			dups = append(dups, id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(dups) > 0 {
+		return InvalidateResult{}, &RejectError{Kind: RejectDuplicateLandmark, Landmarks: dups}
+	}
+
+	// 校验路标存在且当前有效。
+	notFound := make([]string, 0)
+	alreadyInvalid := make([]string, 0)
+	for _, id := range req.LandmarkIDs {
+		lm := st.landmarks[id]
+		if lm == nil {
+			notFound = append(notFound, id)
+			continue
+		}
+		if lm.currentValid() == nil {
+			alreadyInvalid = append(alreadyInvalid, id)
+		}
+	}
+	if len(notFound) > 0 {
+		return InvalidateResult{}, &RejectError{Kind: RejectLandmarkNotFound, Landmarks: notFound}
+	}
+	if len(alreadyInvalid) > 0 {
+		return InvalidateResult{}, &RejectError{Kind: RejectLandmarkAlreadyInvalid, Landmarks: alreadyInvalid}
+	}
+
+	// ---- 全部校验通过：暂存失效并落盘；落盘失败精确回滚 ----
+	invalidTime := st.trajectory[len(st.trajectory)-1].Time
+	result := InvalidateResult{InvalidTime: invalidTime, Appearances: make(map[string]int, len(req.LandmarkIDs))}
+	type undoEntry struct {
+		lm         *landmarkState
+		appearance *landmarkAppearance
+		wasValid   bool
+		oldTime    int64
+		oldReason  string
+	}
+	undo := make([]undoEntry, 0, len(req.LandmarkIDs))
+	for _, id := range req.LandmarkIDs {
+		lm := st.landmarks[id]
+		a := lm.currentValid()
+		result.Appearances[id] = a.number
+		undo = append(undo, undoEntry{lm: lm, appearance: a, wasValid: a.valid, oldTime: a.invalidTime, oldReason: a.invalidReason})
+		a.valid = false
+		a.invalidTime = invalidTime
+		a.invalidReason = req.Reason
+	}
+
+	sortedIDs := append([]string(nil), req.LandmarkIDs...)
+	sort.Strings(sortedIDs)
+	st.invalidations[req.ID] = &invalidationRecord{
+		reason:      req.Reason,
+		landmarkIDs: sortedIDs,
+		result:      cloneInvalidateResult(result),
+	}
+
+	if err := m.saveReplace(); err != nil {
+		for _, u := range undo {
+			u.appearance.valid = u.wasValid
+			u.appearance.invalidTime = u.oldTime
+			u.appearance.invalidReason = u.oldReason
+		}
+		delete(st.invalidations, req.ID)
+		return InvalidateResult{}, err
+	}
+	return result, nil
+}
+
+func cloneInvalidateResult(r InvalidateResult) InvalidateResult {
+	cp := InvalidateResult{InvalidTime: r.InvalidTime, Appearances: make(map[string]int, len(r.Appearances))}
+	for k, v := range r.Appearances {
+		cp.Appearances[k] = v
+	}
+	return cp
+}
+
+// canonicalInvalidationHash 计算一次失效请求的确定性指纹，用于同标识重复
+// 提交判定。原因与路标集合（排序后）参与哈希。
+func canonicalInvalidationHash(reason string, ids []string) string {
+	h := sha256.New()
+	var lenBuf [4]byte
+	putU32 := func(v uint32) {
+		binary.BigEndian.PutUint32(lenBuf[:], v)
+		h.Write(lenBuf[:])
+	}
+	putStr := func(s string) {
+		putU32(uint32(len(s)))
+		h.Write([]byte(s))
+	}
+	putStr(reason)
+	sorted := append([]string(nil), ids...)
+	sort.Strings(sorted)
+	putU32(uint32(len(sorted)))
+	for _, id := range sorted {
+		putStr(id)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // AsRejectError 返回错误对应的 *RejectError；不是段拒绝错误时返回 nil、false。

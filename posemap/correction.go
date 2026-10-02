@@ -112,43 +112,65 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 	sort.Strings(affectedIDs)
 
-	// 逐路标运行聚合：旧文件的既有观测作为固定“旧贡献”起点（位置不
-	// 随校正改变），其余观测按帧时间与同帧输入次序、以当前/校正后位姿
-	// 重放，完整复刻导入时的增量平均与合并距离判定。
+	// 逐路标逐次出现运行聚合：旧文件的既有观测作为首次出现的固定“旧贡献”
+	// 起点（位置不随校正改变），其余观测按帧时间与同帧输入次序、以当前/
+	// 校正后位姿重放，完整复刻导入时的增量平均与合并距离判定。各次出现
+	// 独立聚合、分别遵守合并距离限制。
 	type agg struct {
 		count int
 		x, y  float64
 	}
-	aggs := make(map[string]*agg, len(affectedIDs))
+	// aggs[landmarkID][appearanceNumber] = aggregate
+	aggs := make(map[string]map[int]*agg, len(affectedIDs))
+	// affectedApps[landmarkID] = set of appearance numbers with observations
+	// in the correction range [anchorIdx, end] — only those are recorded.
+	affectedApps := make(map[string]map[int]struct{}, len(affectedIDs))
 	for _, id := range affectedIDs {
-		lm := st.landmarks[id]
-		a := &agg{}
-		if lm != nil && lm.legacyCount > 0 {
-			a.count = lm.legacyCount
-			a.x = lm.legacyMX
-			a.y = lm.legacyMY
-		}
-		aggs[id] = a
+		aggs[id] = make(map[int]*agg)
+		affectedApps[id] = make(map[int]struct{})
 	}
 	for j := 1; j <= end; j++ {
 		src := st.sources[j-1]
 		if src == nil {
-			continue // 旧文件帧：观测已计入各路标 legacy 起点
+			continue // 旧文件帧：观测已计入首次出现的 legacy 起点
 		}
 		pose := next[j]
+		inRange := j >= anchorIdx
 		for _, ob := range src.observations {
-			a, ok := aggs[ob.ID]
+			byLM, ok := aggs[ob.ID]
 			if !ok {
 				continue
+			}
+			lm := st.landmarks[ob.ID]
+			appIdx := lm.appearanceAt(st.trajectory[j].Time)
+			if appIdx < 0 {
+				continue
+			}
+			app := lm.appearances[appIdx]
+			if inRange {
+				affectedApps[ob.ID][app.number] = struct{}{}
+			}
+			a, ok := byLM[app.number]
+			if !ok {
+				a = &agg{}
+				// 首次出现从固定旧贡献起点开始。
+				if app.number == 1 && app.legacyCount > 0 {
+					a.count = app.legacyCount
+					a.x = app.legacyMX
+					a.y = app.legacyMY
+				}
+				byLM[app.number] = a
 			}
 			mx, my := localToMap(pose.X, pose.Y, pose.Heading, ob.X, ob.Y)
 			if a.count > 0 && math.Hypot(mx-a.x, my-a.y) > st.config.MergeDistance {
 				return CorrectionRecord{}, &RejectError{
-					Kind:        RejectLandmarkConflict,
-					Time:        st.trajectory[j].Time,
-					HasTime:     true,
-					Landmark:    ob.ID,
-					HasLandmark: true,
+					Kind:          RejectLandmarkConflict,
+					Time:          st.trajectory[j].Time,
+					HasTime:       true,
+					Landmark:      ob.ID,
+					HasLandmark:   true,
+					Appearance:    app.number,
+					HasAppearance: true,
 				}
 			}
 			a.x = (a.x*float64(a.count) + mx) / float64(a.count+1)
@@ -156,13 +178,17 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 			a.count++
 		}
 	}
-	for id, a := range aggs {
-		if !isFinite(a.x) || !isFinite(a.y) {
-			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
-		}
-		if lm := st.landmarks[id]; lm == nil || a.count != lm.count {
-			// 内存不变量被破坏不可能由本包写出，按损坏处理而非半提交。
-			return CorrectionRecord{}, ErrCorrupt
+	for id, byLM := range aggs {
+		lm := st.landmarks[id]
+		for num, a := range byLM {
+			if !isFinite(a.x) || !isFinite(a.y) {
+				return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
+			}
+			app := lm.appearanceByNumber(num)
+			if app == nil || a.count != app.count {
+				// 内存不变量被破坏不可能由本包写出，按损坏处理而非半提交。
+				return CorrectionRecord{}, ErrCorrupt
+			}
 		}
 	}
 
@@ -180,43 +206,67 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 	for _, id := range affectedIDs {
 		lm := st.landmarks[id]
-		a := aggs[id]
-		rec.Landmarks = append(rec.Landmarks, LandmarkChange{
-			ID:     id,
-			Before: Landmark{ID: id, X: lm.x, Y: lm.y, Count: lm.count},
-			After:  Landmark{ID: id, X: a.x, Y: a.y, Count: a.count},
-		})
+		lc := LandmarkChange{ID: id}
+		// 按编号递增收集各次受影响出现的校正前后值（仅校正范围内有观测的出现）。
+		nums := make([]int, 0, len(affectedApps[id]))
+		for num := range affectedApps[id] {
+			nums = append(nums, num)
+		}
+		sort.Ints(nums)
+		for _, num := range nums {
+			a := aggs[id][num]
+			app := lm.appearanceByNumber(num)
+			lc.Appearances = append(lc.Appearances, AppearanceChange{
+				Number: num,
+				Before: Landmark{ID: id, X: app.x, Y: app.y, Count: app.count},
+				After:  Landmark{ID: id, X: a.x, Y: a.y, Count: a.count},
+			})
+		}
+		// Before/After 保持为首次受影响出现的校正前后值，兼容既有调用方。
+		if len(lc.Appearances) > 0 {
+			lc.Before = lc.Appearances[0].Before
+			lc.After = lc.Appearances[0].After
+		}
+		rec.Landmarks = append(rec.Landmarks, lc)
 	}
 
 	// ---- 全部校验通过：暂存提交并落盘；落盘失败精确回滚 ----
 	oldTraj := append([]Pose(nil), st.trajectory...)
-	type lmSnapshot struct {
-		x, y               float64
-		count, legacyCount int
-		legacyMX, legacyMY float64
+	// 按 (路标标识, 出现编号) 快照受影响出现的校正前位置，用于精确回滚。
+	type appSnapshot struct {
+		x, y float64
 	}
-	oldLM := make(map[string]lmSnapshot, len(affectedIDs))
+	oldApps := make(map[string]map[int]appSnapshot, len(affectedIDs))
 	for _, id := range affectedIDs {
 		lm := st.landmarks[id]
-		oldLM[id] = lmSnapshot{lm.x, lm.y, lm.count, lm.legacyCount, lm.legacyMX, lm.legacyMY}
+		oldApps[id] = make(map[int]appSnapshot, len(affectedApps[id]))
+		for num := range affectedApps[id] {
+			app := lm.appearanceByNumber(num)
+			oldApps[id][num] = appSnapshot{app.x, app.y}
+		}
 	}
 	oldCorrLen := len(st.corrections)
 
 	st.trajectory = next
 	for _, id := range affectedIDs {
-		a := aggs[id]
 		lm := st.landmarks[id]
-		lm.x, lm.y = a.x, a.y
+		for num := range affectedApps[id] {
+			a := aggs[id][num]
+			app := lm.appearanceByNumber(num)
+			app.x, app.y = a.x, a.y
+		}
 	}
 	st.corrections = append(st.corrections, rec)
 	st.corrIndex[req.ID] = canonicalCorrectionHash(req.Anchor, tgt)
 
 	if err := m.saveReplace(); err != nil {
 		st.trajectory = oldTraj
-		for id, s := range oldLM {
+		for id, byNum := range oldApps {
 			lm := st.landmarks[id]
-			lm.x, lm.y, lm.count = s.x, s.y, s.count
-			lm.legacyCount, lm.legacyMX, lm.legacyMY = s.legacyCount, s.legacyMX, s.legacyMY
+			for num, s := range byNum {
+				app := lm.appearanceByNumber(num)
+				app.x, app.y = s.x, s.y
+			}
 		}
 		st.corrections = st.corrections[:oldCorrLen]
 		delete(st.corrIndex, req.ID)
@@ -255,6 +305,12 @@ func cloneRecord(rec *CorrectionRecord) CorrectionRecord {
 	}
 	cp := *rec
 	cp.Poses = append([]PoseChange(nil), rec.Poses...)
-	cp.Landmarks = append([]LandmarkChange(nil), rec.Landmarks...)
+	cp.Landmarks = make([]LandmarkChange, len(rec.Landmarks))
+	for i, lc := range rec.Landmarks {
+		cp.Landmarks[i] = lc
+		if lc.Appearances != nil {
+			cp.Landmarks[i].Appearances = append([]AppearanceChange(nil), lc.Appearances...)
+		}
+	}
 	return cp
 }

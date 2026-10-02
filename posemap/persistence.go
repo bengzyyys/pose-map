@@ -32,23 +32,39 @@ const (
 )
 
 type fileData struct {
-	Version     int             `json:"version"`
-	Config      Config          `json:"config"`
-	Trajectory  []Pose          `json:"trajectory"`
-	Landmarks   []landmarkJSON  `json:"landmarks"`
-	Segments    []segmentJSON   `json:"segments"`
-	Sources     []*frameSrcJSON `json:"sources,omitempty"`     // 新格式：逐帧依据，旧帧为 null；旧文件整列缺省
-	Corrections []corrRecJSON   `json:"corrections,omitempty"` // 新格式：按提交次序的校正记录
+	Version       int                `json:"version"`
+	Config        Config             `json:"config"`
+	Trajectory    []Pose             `json:"trajectory"`
+	Landmarks     []landmarkJSON     `json:"landmarks"`
+	Segments      []segmentJSON      `json:"segments"`
+	Sources       []*frameSrcJSON    `json:"sources,omitempty"`       // 新格式：逐帧依据，旧帧为 null；旧文件整列缺省
+	Corrections   []corrRecJSON      `json:"corrections,omitempty"`   // 新格式：按提交次序的校正记录
+	Invalidations []invalidationJSON `json:"invalidations,omitempty"` // 新格式：失效操作记录
 }
 
 type landmarkJSON struct {
-	ID          string  `json:"id"`
-	X           float64 `json:"x"`
-	Y           float64 `json:"y"`
-	Count       int     `json:"count"`
-	LegacyCount int     `json:"legacy_count,omitempty"`
-	LegacyMX    float64 `json:"legacy_mx,omitempty"`
-	LegacyMY    float64 `json:"legacy_my,omitempty"`
+	ID          string           `json:"id"`
+	X           float64          `json:"x,omitempty"`            // 旧格式：聚合位置
+	Y           float64          `json:"y,omitempty"`            // 旧格式
+	Count       int              `json:"count,omitempty"`        // 旧格式
+	LegacyCount int              `json:"legacy_count,omitempty"` // 旧格式
+	LegacyMX    float64          `json:"legacy_mx,omitempty"`    // 旧格式
+	LegacyMY    float64          `json:"legacy_my,omitempty"`    // 旧格式
+	Appearances []appearanceJSON `json:"appearances,omitempty"`  // 新格式：各次出现
+}
+
+type appearanceJSON struct {
+	Number        int     `json:"number"`
+	X             float64 `json:"x"`
+	Y             float64 `json:"y"`
+	Count         int     `json:"count"`
+	Valid         bool    `json:"valid"`
+	FirstTime     int64   `json:"first_time"`
+	InvalidTime   int64   `json:"invalid_time,omitempty"`
+	InvalidReason string  `json:"invalid_reason,omitempty"`
+	LegacyCount   int     `json:"legacy_count,omitempty"`
+	LegacyMX      float64 `json:"legacy_mx,omitempty"`
+	LegacyMY      float64 `json:"legacy_my,omitempty"`
 }
 
 type segmentJSON struct {
@@ -68,7 +84,14 @@ type poseChangeJSON struct {
 }
 
 type landmarkChangeJSON struct {
-	ID     string   `json:"id"`
+	ID          string                 `json:"id"`
+	Before      Landmark               `json:"before"`
+	After       Landmark               `json:"after"`
+	Appearances []appearanceChangeJSON `json:"appearances,omitempty"`
+}
+
+type appearanceChangeJSON struct {
+	Number int      `json:"number"`
 	Before Landmark `json:"before"`
 	After  Landmark `json:"after"`
 }
@@ -82,27 +105,44 @@ type corrRecJSON struct {
 	Landmarks []landmarkChangeJSON `json:"landmarks"`
 }
 
+type invalidationJSON struct {
+	ID          string         `json:"id"`
+	Reason      string         `json:"reason"`
+	LandmarkIDs []string       `json:"landmark_ids"`
+	InvalidTime int64          `json:"invalid_time"`
+	Appearances map[string]int `json:"appearances"`
+}
+
 // encodeFile 把内存状态编码为完整文件字节。
 func encodeFile(st *mapState) ([]byte, error) {
 	fd := fileData{
-		Version:     int(fileVersion),
-		Config:      st.config,
-		Trajectory:  st.trajectory,
-		Landmarks:   make([]landmarkJSON, 0, len(st.landmarks)),
-		Segments:    make([]segmentJSON, 0, len(st.segments)),
-		Sources:     make([]*frameSrcJSON, len(st.sources)),
-		Corrections: make([]corrRecJSON, 0, len(st.corrections)),
+		Version:       int(fileVersion),
+		Config:        st.config,
+		Trajectory:    st.trajectory,
+		Landmarks:     make([]landmarkJSON, 0, len(st.landmarks)),
+		Segments:      make([]segmentJSON, 0, len(st.segments)),
+		Sources:       make([]*frameSrcJSON, len(st.sources)),
+		Corrections:   make([]corrRecJSON, 0, len(st.corrections)),
+		Invalidations: make([]invalidationJSON, 0, len(st.invalidations)),
 	}
 	for id, lm := range st.landmarks {
-		fd.Landmarks = append(fd.Landmarks, landmarkJSON{
-			ID:          id,
-			X:           lm.x,
-			Y:           lm.y,
-			Count:       lm.count,
-			LegacyCount: lm.legacyCount,
-			LegacyMX:    lm.legacyMX,
-			LegacyMY:    lm.legacyMY,
-		})
+		lj := landmarkJSON{ID: id, Appearances: make([]appearanceJSON, 0, len(lm.appearances))}
+		for _, a := range lm.appearances {
+			lj.Appearances = append(lj.Appearances, appearanceJSON{
+				Number:        a.number,
+				X:             a.x,
+				Y:             a.y,
+				Count:         a.count,
+				Valid:         a.valid,
+				FirstTime:     a.firstTime,
+				InvalidTime:   a.invalidTime,
+				InvalidReason: a.invalidReason,
+				LegacyCount:   a.legacyCount,
+				LegacyMX:      a.legacyMX,
+				LegacyMY:      a.legacyMY,
+			})
+		}
+		fd.Landmarks = append(fd.Landmarks, lj)
 	}
 	for id, rec := range st.segments {
 		fd.Segments = append(fd.Segments, segmentJSON{ID: id, Hash: rec.hash, Result: rec.result})
@@ -127,9 +167,29 @@ func encodeFile(st *mapState) ([]byte, error) {
 			cj.Poses[i] = poseChangeJSON{Before: pc.Before, After: pc.After}
 		}
 		for i, lc := range rec.Landmarks {
-			cj.Landmarks[i] = landmarkChangeJSON{ID: lc.ID, Before: lc.Before, After: lc.After}
+			acj := landmarkChangeJSON{ID: lc.ID, Before: lc.Before, After: lc.After}
+			if len(lc.Appearances) > 0 {
+				acj.Appearances = make([]appearanceChangeJSON, len(lc.Appearances))
+				for j, ac := range lc.Appearances {
+					acj.Appearances[j] = appearanceChangeJSON{Number: ac.Number, Before: ac.Before, After: ac.After}
+				}
+			}
+			cj.Landmarks[i] = acj
 		}
 		fd.Corrections = append(fd.Corrections, cj)
+	}
+	for id, rec := range st.invalidations {
+		apps := make(map[string]int, len(rec.result.Appearances))
+		for k, v := range rec.result.Appearances {
+			apps[k] = v
+		}
+		fd.Invalidations = append(fd.Invalidations, invalidationJSON{
+			ID:          id,
+			Reason:      rec.reason,
+			LandmarkIDs: append([]string(nil), rec.landmarkIDs...),
+			InvalidTime: rec.result.InvalidTime,
+			Appearances: apps,
+		})
 	}
 	payload, err := json.Marshal(&fd)
 	if err != nil {
@@ -177,33 +237,65 @@ func loadFile(path string) (*mapState, error) {
 	}
 
 	st := &mapState{
-		config:      fd.Config,
-		trajectory:  fd.Trajectory,
-		landmarks:   make(map[string]*landmarkState, len(fd.Landmarks)),
-		segments:    make(map[string]*segmentRecord, len(fd.Segments)),
-		sources:     make([]*frameSource, len(fd.Trajectory)-1),
-		corrections: make([]*CorrectionRecord, 0, len(fd.Corrections)),
-		corrIndex:   make(map[string]string, len(fd.Corrections)),
+		config:        fd.Config,
+		trajectory:    fd.Trajectory,
+		landmarks:     make(map[string]*landmarkState, len(fd.Landmarks)),
+		segments:      make(map[string]*segmentRecord, len(fd.Segments)),
+		sources:       make([]*frameSource, len(fd.Trajectory)-1),
+		corrections:   make([]*CorrectionRecord, 0, len(fd.Corrections)),
+		corrIndex:     make(map[string]string, len(fd.Corrections)),
+		invalidations: make(map[string]*invalidationRecord, len(fd.Invalidations)),
 	}
 	// 旧文件不携带逐帧依据：有帧而 sources 缺省即旧地图。无帧时二者
 	// 无法区分也无需区分（尚无范围可校正）。
 	oldFormat := len(fd.Sources) == 0 && len(fd.Trajectory) > 1
 	for _, lm := range fd.Landmarks {
-		legacyCount := lm.LegacyCount
-		legacyMX, legacyMY := lm.LegacyMX, lm.LegacyMY
-		// 旧文件中该路标的全部既有观测都是固定旧贡献，位置取文件中的聚合值。
-		if oldFormat {
-			legacyCount = lm.Count
-			legacyMX, legacyMY = lm.X, lm.Y
+		ls := &landmarkState{}
+		if len(lm.Appearances) > 0 {
+			// 新格式：直接加载各次出现。
+			for _, aj := range lm.Appearances {
+				ls.appearances = append(ls.appearances, &landmarkAppearance{
+					number:        aj.Number,
+					x:             aj.X,
+					y:             aj.Y,
+					count:         aj.Count,
+					valid:         aj.Valid,
+					firstTime:     aj.FirstTime,
+					invalidTime:   aj.InvalidTime,
+					invalidReason: aj.InvalidReason,
+					legacyCount:   aj.LegacyCount,
+					legacyMX:      aj.LegacyMX,
+					legacyMY:      aj.LegacyMY,
+				})
+			}
+			// 旧文件（无逐帧依据）：首次出现的全部既有观测视为固定旧贡献。
+			if oldFormat && len(ls.appearances) > 0 {
+				first := ls.appearances[0]
+				first.legacyCount = first.count
+				first.legacyMX, first.legacyMY = first.x, first.y
+				first.firstTime = -1
+			}
+		} else {
+			// 旧格式：全部既有观测视为首次出现的固定旧贡献，首次观测时间未知。
+			legacyCount := lm.LegacyCount
+			legacyMX, legacyMY := lm.LegacyMX, lm.LegacyMY
+			if oldFormat {
+				legacyCount = lm.Count
+				legacyMX, legacyMY = lm.X, lm.Y
+			}
+			ls.appearances = append(ls.appearances, &landmarkAppearance{
+				number:      1,
+				x:           lm.X,
+				y:           lm.Y,
+				count:       lm.Count,
+				valid:       true,
+				firstTime:   -1,
+				legacyCount: legacyCount,
+				legacyMX:    legacyMX,
+				legacyMY:    legacyMY,
+			})
 		}
-		st.landmarks[lm.ID] = &landmarkState{
-			x:           lm.X,
-			y:           lm.Y,
-			count:       lm.Count,
-			legacyCount: legacyCount,
-			legacyMX:    legacyMX,
-			legacyMY:    legacyMY,
-		}
+		st.landmarks[lm.ID] = ls
 	}
 	for _, sg := range fd.Segments {
 		ids := sg.Result.LandmarkIDs
@@ -237,10 +329,27 @@ func loadFile(path string) (*mapState, error) {
 			rec.Poses[i] = PoseChange{Before: pc.Before, After: pc.After}
 		}
 		for i, lc := range cj.Landmarks {
-			rec.Landmarks[i] = LandmarkChange{ID: lc.ID, Before: lc.Before, After: lc.After}
+			change := LandmarkChange{ID: lc.ID, Before: lc.Before, After: lc.After}
+			for _, ac := range lc.Appearances {
+				change.Appearances = append(change.Appearances, AppearanceChange{
+					Number: ac.Number, Before: ac.Before, After: ac.After,
+				})
+			}
+			rec.Landmarks[i] = change
 		}
 		st.corrections = append(st.corrections, rec)
 		st.corrIndex[cj.ID] = canonicalCorrectionHash(cj.Anchor, cj.Target)
+	}
+	for _, ij := range fd.Invalidations {
+		apps := make(map[string]int, len(ij.Appearances))
+		for k, v := range ij.Appearances {
+			apps[k] = v
+		}
+		st.invalidations[ij.ID] = &invalidationRecord{
+			reason:      ij.Reason,
+			landmarkIDs: append([]string(nil), ij.LandmarkIDs...),
+			result:      InvalidateResult{InvalidTime: ij.InvalidTime, Appearances: apps},
+		}
 	}
 	return st, nil
 }
@@ -272,14 +381,38 @@ func validateLoaded(fd *fileData) error {
 	}
 	seenIDs := make(map[string]struct{}, len(fd.Landmarks))
 	for _, lm := range fd.Landmarks {
-		if lm.ID == "" || lm.Count < 1 || !isFinite(lm.X) || !isFinite(lm.Y) {
+		if lm.ID == "" {
 			return fmt.Errorf("%w: invalid landmark record", ErrCorrupt)
 		}
-		if lm.LegacyCount < 0 || lm.LegacyCount > lm.Count {
-			return fmt.Errorf("%w: invalid legacy count for landmark %s", ErrCorrupt, lm.ID)
-		}
-		if lm.LegacyCount > 0 && (!isFinite(lm.LegacyMX) || !isFinite(lm.LegacyMY)) {
-			return fmt.Errorf("%w: invalid legacy mean for landmark %s", ErrCorrupt, lm.ID)
+		if len(lm.Appearances) > 0 {
+			// 新格式：校验各次出现。
+			seenNums := make(map[int]struct{}, len(lm.Appearances))
+			for _, aj := range lm.Appearances {
+				if aj.Number < 1 || aj.Count < 1 || !isFinite(aj.X) || !isFinite(aj.Y) {
+					return fmt.Errorf("%w: invalid appearance for landmark %s", ErrCorrupt, lm.ID)
+				}
+				if aj.LegacyCount < 0 || aj.LegacyCount > aj.Count {
+					return fmt.Errorf("%w: invalid legacy count for landmark %s", ErrCorrupt, lm.ID)
+				}
+				if aj.LegacyCount > 0 && (!isFinite(aj.LegacyMX) || !isFinite(aj.LegacyMY)) {
+					return fmt.Errorf("%w: invalid legacy mean for landmark %s", ErrCorrupt, lm.ID)
+				}
+				if _, dup := seenNums[aj.Number]; dup {
+					return fmt.Errorf("%w: duplicate appearance %d for landmark %s", ErrCorrupt, aj.Number, lm.ID)
+				}
+				seenNums[aj.Number] = struct{}{}
+			}
+		} else {
+			// 旧格式：校验聚合字段。
+			if lm.Count < 1 || !isFinite(lm.X) || !isFinite(lm.Y) {
+				return fmt.Errorf("%w: invalid landmark record", ErrCorrupt)
+			}
+			if lm.LegacyCount < 0 || lm.LegacyCount > lm.Count {
+				return fmt.Errorf("%w: invalid legacy count for landmark %s", ErrCorrupt, lm.ID)
+			}
+			if lm.LegacyCount > 0 && (!isFinite(lm.LegacyMX) || !isFinite(lm.LegacyMY)) {
+				return fmt.Errorf("%w: invalid legacy mean for landmark %s", ErrCorrupt, lm.ID)
+			}
 		}
 		if _, dup := seenIDs[lm.ID]; dup {
 			return fmt.Errorf("%w: duplicate landmark %s", ErrCorrupt, lm.ID)
@@ -313,6 +446,16 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: duplicate correction %s", ErrCorrupt, cr.ID)
 		}
 		corrIDs[cr.ID] = struct{}{}
+	}
+	invIDs := make(map[string]struct{}, len(fd.Invalidations))
+	for _, inv := range fd.Invalidations {
+		if inv.ID == "" || inv.Reason == "" || len(inv.LandmarkIDs) == 0 {
+			return fmt.Errorf("%w: invalid invalidation record", ErrCorrupt)
+		}
+		if _, dup := invIDs[inv.ID]; dup {
+			return fmt.Errorf("%w: duplicate invalidation %s", ErrCorrupt, inv.ID)
+		}
+		invIDs[inv.ID] = struct{}{}
 	}
 	return nil
 }

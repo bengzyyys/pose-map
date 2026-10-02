@@ -592,8 +592,15 @@ func recordsEqual(a, b CorrectionRecord) bool {
 		}
 	}
 	for i := range a.Landmarks {
-		if a.Landmarks[i] != b.Landmarks[i] {
+		la, lb := a.Landmarks[i], b.Landmarks[i]
+		if la.ID != lb.ID || la.Before != lb.Before || la.After != lb.After ||
+			len(la.Appearances) != len(lb.Appearances) {
 			return false
+		}
+		for j := range la.Appearances {
+			if la.Appearances[j] != lb.Appearances[j] {
+				return false
+			}
 		}
 	}
 	return true
