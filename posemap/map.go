@@ -19,17 +19,36 @@ type Map struct {
 
 // mapState 是地图的全部内存状态。
 type mapState struct {
-	config     Config
-	trajectory []Pose // 按时间严格递增；trajectory[0] 为初始位姿
-	landmarks  map[string]*landmarkState
-	segments   map[string]*segmentRecord
+	config      Config
+	trajectory  []Pose // 按时间严格递增；trajectory[0] 为初始位姿
+	landmarks   map[string]*landmarkState
+	segments    map[string]*segmentRecord
+	sources     []*frameSource // sources[k] 对应 trajectory[k+1]；长度恒为 len(trajectory)-1
+	corrections []*CorrectionRecord
+	corrIndex   map[string]string // 校正标识 -> 首次内容指纹
+}
+
+// frameSource 是生成某一帧的原始输入，供回环校正重放路标观测与累计
+// 原运动方差。该切片中的 nil 元素表示对应帧来自不携带逐帧依据的旧
+// 文件，涉及它的历史范围不能校正。
+type frameSource struct {
+	moveVariance float64
+	observations []Observation
 }
 
 // landmarkState 是路标在地图坐标下的聚合状态。
+//
+// legacy* 只用于打开不携带逐帧观测来源的旧文件：旧文件中每一帧的观测
+// 无法重放，因此旧文件里该路标的全部观测贡献视为固定的 legacyCount 次
+// 平均，不随后续校正改变；旧文件之后新导入且依据完整的观测再做增量
+// 平均。由本版本创建/导入的路标 legacyCount 为 0，全部观测均可重放。
 type landmarkState struct {
-	x     float64
-	y     float64
-	count int
+	x           float64
+	y           float64
+	count       int
+	legacyCount int
+	legacyMX    float64
+	legacyMY    float64
 }
 
 // segmentRecord 记录一个已成功保存的段：内容指纹与首次导入结果，
@@ -57,6 +76,7 @@ func Create(path string, cfg Config) (*Map, error) {
 		trajectory: []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
 		landmarks:  make(map[string]*landmarkState),
 		segments:   make(map[string]*segmentRecord),
+		corrIndex:  make(map[string]string),
 	}
 	m := &Map{path: path, state: st}
 	// O_EXCL：目标已存在即失败，绝不当作新地图覆盖。
@@ -223,8 +243,17 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	sort.Strings(ids)
 	res := ImportResult{EndPose: cur, LandmarkIDs: ids}
 
+	// 逐帧依据（原运动方差与原始观测）与位姿一一对应，供以后的回环
+	// 校正重放。
+	newSources := make([]*frameSource, len(seg.Frames))
+	for i, f := range seg.Frames {
+		obs := append([]Observation(nil), f.Observations...)
+		newSources[i] = &frameSource{moveVariance: f.MoveVariance, observations: obs}
+	}
+
 	// ---- 全部校验通过：提交内存状态并落盘；落盘失败精确回滚 ----
 	trajLenBefore := len(st.trajectory)
+	srcLenBefore := len(st.sources)
 	type undoLandmark struct {
 		lm *landmarkState
 		ok bool
@@ -236,10 +265,12 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		st.landmarks[id] = nl
 	}
 	st.trajectory = append(st.trajectory, newPoses...)
+	st.sources = append(st.sources, newSources...)
 	st.segments[seg.ID] = &segmentRecord{hash: canonicalHash(seg.Frames), result: cloneResult(res)}
 
 	if err := m.saveReplace(); err != nil {
 		st.trajectory = st.trajectory[:trajLenBefore]
+		st.sources = st.sources[:srcLenBefore]
 		for id, u := range undo {
 			if u.ok {
 				st.landmarks[id] = u.lm

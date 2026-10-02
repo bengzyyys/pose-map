@@ -65,18 +65,63 @@ type Landmark struct {
 	Count int
 }
 
-// RejectError 表示一次段导入因语义不合法而被整段拒绝。
+// CorrectionTarget 是已确认回环提交的目标：某个已保存帧应有的位姿与
+// 非负位置方差。位置单位为米，朝向单位为弧度。
+type CorrectionTarget struct {
+	X        float64
+	Y        float64
+	Heading  float64
+	Variance float64
+}
+
+// Correction 是一次已确认回环校正请求：非空标识、必须命中已导入帧的
+// 锚点时间，以及该帧应有的位姿与非负位置方差。
+type Correction struct {
+	ID     string           // 校正标识，非空
+	Anchor int64            // 已保存帧的准确时间（毫秒）
+	Target CorrectionTarget // 锚点帧应有的位姿与方差
+}
+
+// PoseChange 是一帧位姿的校正前后值。
+type PoseChange struct {
+	Before Pose
+	After  Pose
+}
+
+// LandmarkChange 是一个路标的校正前后值（观测次数不变）。
+type LandmarkChange struct {
+	ID     string
+	Before Landmark
+	After  Landmark
+}
+
+// CorrectionRecord 是一次成功校正按提交次序保留的记录。后续校正可
+// 覆盖相同时间范围，但先前记录永不被改写。
+type CorrectionRecord struct {
+	ID        string           // 校正标识
+	Anchor    int64            // 锚点帧时间
+	Target    CorrectionTarget // 提交目标
+	EndTime   int64            // 受影响末帧时间（提交时的末帧）
+	Poses     []PoseChange     // 受影响位姿的校正前后值，按时间升序
+	Landmarks []LandmarkChange // 受影响路标的校正前后值，按标识排序
+}
+
+// RejectError 表示一次段导入或回环校正因语义不合法而被整体拒绝。
 //
 // Kind 为可区分的拒绝原因（见 Reject* 常量）；当原因涉及具体帧时，
 // Frame 给出从零开始的帧序号且 HasFrame 为真；路标冲突时 Landmark
 // 给出涉及的路标标识；重复段内容冲突时 Landmark 给出冲突的段标识。
-// 两种情况下 HasLandmark 均为真。
+// 两种情况下 HasLandmark 均为真。校正类原因用 Time 给出提交的锚点
+// 时间且 HasTime 为真；校正中路标冲突时 Time 改为给出冲突观测所在帧的
+// 时间、Landmark 给出路标标识，HasLandmark 为真。
 type RejectError struct {
 	Kind        string
 	Frame       int
 	HasFrame    bool
 	Landmark    string
 	HasLandmark bool
+	Time        int64
+	HasTime     bool
 }
 
 func (e *RejectError) Error() string {
@@ -87,10 +132,16 @@ func (e *RejectError) Error() string {
 		if e.HasFrame {
 			return "posemap: frame " + strconv.Itoa(e.Frame) + " has empty landmark id"
 		}
-		return "posemap: empty segment id"
+		return "posemap: empty segment or correction id"
 	case RejectNegativeVariance:
+		if e.HasTime {
+			return "posemap: correction target variance is negative"
+		}
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " has negative motion variance"
 	case RejectNonFinite:
+		if e.HasTime {
+			return "posemap: correction target or corrected result has non-finite value"
+		}
 		if e.HasLandmark {
 			return "posemap: frame " + strconv.Itoa(e.Frame) + " has non-finite observation of landmark " + e.Landmark
 		}
@@ -103,24 +154,36 @@ func (e *RejectError) Error() string {
 	case RejectInterval:
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " exceeds the maximum time interval"
 	case RejectLandmarkConflict:
+		if e.HasTime {
+			return "posemap: correction conflicts landmark " + e.Landmark + " at frame time " + strconv.FormatInt(e.Time, 10)
+		}
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " observation of landmark " + e.Landmark + " is beyond merge distance"
 	case RejectDuplicateMismatch:
 		return "posemap: segment id " + e.Landmark + " already saved with different content"
+	case RejectAnchorNotFound:
+		return "posemap: anchor time " + strconv.FormatInt(e.Time, 10) + " does not match an imported frame"
+	case RejectCorrectionMismatch:
+		return "posemap: correction id " + e.Landmark + " already saved with different content"
+	case RejectNoBasis:
+		return "posemap: correction range from " + strconv.FormatInt(e.Time, 10) + " lacks per-frame observation sources"
 	default:
-		return "posemap: segment rejected (" + e.Kind + ")"
+		return "posemap: request rejected (" + e.Kind + ")"
 	}
 }
 
 // 可区分的拒绝原因。
 const (
-	RejectEmptySegment      = "empty_segment"      // 空批次
-	RejectEmptyID           = "empty_id"           // 空段标识或空路标标识
-	RejectNegativeVariance  = "negative_variance"  // 负运动方差
-	RejectNonFinite         = "non_finite"         // 非有限数值（NaN/Inf）
-	RejectTimeOrder         = "time_order"         // 时间未严格递增或首帧不够晚
-	RejectInterval          = "interval_exceeded"  // 相邻位姿间隔超过上限
-	RejectLandmarkConflict  = "landmark_conflict"  // 同标识路标超出合并距离
-	RejectDuplicateMismatch = "duplicate_mismatch" // 同一段标识对应不同内容
+	RejectEmptySegment       = "empty_segment"       // 空批次
+	RejectEmptyID            = "empty_id"            // 空段/路标/校正标识
+	RejectNegativeVariance   = "negative_variance"   // 负运动方差或负目标方差
+	RejectNonFinite          = "non_finite"          // 非有限数值（NaN/Inf）
+	RejectTimeOrder          = "time_order"          // 时间未严格递增或首帧不够晚
+	RejectInterval           = "interval_exceeded"   // 相邻位姿间隔超过上限
+	RejectLandmarkConflict   = "landmark_conflict"   // 同标识路标超出合并距离
+	RejectDuplicateMismatch  = "duplicate_mismatch"  // 同一段标识对应不同内容
+	RejectAnchorNotFound     = "anchor_not_found"    // 校正锚点未命中已导入帧
+	RejectCorrectionMismatch = "correction_mismatch" // 同一校正标识对应不同内容
+	RejectNoBasis            = "no_basis"            // 旧地图缺少逐帧观测来源
 )
 
 // 哨兵错误，供 errors.Is 使用。

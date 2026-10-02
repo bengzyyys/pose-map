@@ -22,6 +22,9 @@ import (
 // 保存采用“同目录临时文件写完并 fsync 后 rename”的方式，成功导入对
 // 调用方可见时文件必为完整的新版本；无法识别或校验失败的文件绝不被
 // 覆盖（Create 用 O_EXCL，Open 只读取证）。
+// 文件格式在版本 1 内以“追加 JSON 字段”的方式演进：旧文件不含
+// sources/corrections 字段（解码后为 nil/空），据此识别缺少逐帧依据的
+// 旧地图；二进制版本号保持 1，不支持的版本号仍按既有约定拒绝。
 const (
 	fileMagic   = "POSEMAP1"
 	fileVersion = uint16(1)
@@ -29,18 +32,23 @@ const (
 )
 
 type fileData struct {
-	Version    int            `json:"version"`
-	Config     Config         `json:"config"`
-	Trajectory []Pose         `json:"trajectory"`
-	Landmarks  []landmarkJSON `json:"landmarks"`
-	Segments   []segmentJSON  `json:"segments"`
+	Version     int             `json:"version"`
+	Config      Config          `json:"config"`
+	Trajectory  []Pose          `json:"trajectory"`
+	Landmarks   []landmarkJSON  `json:"landmarks"`
+	Segments    []segmentJSON   `json:"segments"`
+	Sources     []*frameSrcJSON `json:"sources,omitempty"`     // 新格式：逐帧依据，旧帧为 null；旧文件整列缺省
+	Corrections []corrRecJSON   `json:"corrections,omitempty"` // 新格式：按提交次序的校正记录
 }
 
 type landmarkJSON struct {
-	ID    string  `json:"id"`
-	X     float64 `json:"x"`
-	Y     float64 `json:"y"`
-	Count int     `json:"count"`
+	ID          string  `json:"id"`
+	X           float64 `json:"x"`
+	Y           float64 `json:"y"`
+	Count       int     `json:"count"`
+	LegacyCount int     `json:"legacy_count,omitempty"`
+	LegacyMX    float64 `json:"legacy_mx,omitempty"`
+	LegacyMY    float64 `json:"legacy_my,omitempty"`
 }
 
 type segmentJSON struct {
@@ -49,20 +57,79 @@ type segmentJSON struct {
 	Result ImportResult `json:"result"`
 }
 
+type frameSrcJSON struct {
+	MoveVariance float64       `json:"move_variance"`
+	Observations []Observation `json:"observations"`
+}
+
+type poseChangeJSON struct {
+	Before Pose `json:"before"`
+	After  Pose `json:"after"`
+}
+
+type landmarkChangeJSON struct {
+	ID     string   `json:"id"`
+	Before Landmark `json:"before"`
+	After  Landmark `json:"after"`
+}
+
+type corrRecJSON struct {
+	ID        string               `json:"id"`
+	Anchor    int64                `json:"anchor"`
+	Target    CorrectionTarget     `json:"target"`
+	EndTime   int64                `json:"end_time"`
+	Poses     []poseChangeJSON     `json:"poses"`
+	Landmarks []landmarkChangeJSON `json:"landmarks"`
+}
+
 // encodeFile 把内存状态编码为完整文件字节。
 func encodeFile(st *mapState) ([]byte, error) {
 	fd := fileData{
-		Version:    int(fileVersion),
-		Config:     st.config,
-		Trajectory: st.trajectory,
-		Landmarks:  make([]landmarkJSON, 0, len(st.landmarks)),
-		Segments:   make([]segmentJSON, 0, len(st.segments)),
+		Version:     int(fileVersion),
+		Config:      st.config,
+		Trajectory:  st.trajectory,
+		Landmarks:   make([]landmarkJSON, 0, len(st.landmarks)),
+		Segments:    make([]segmentJSON, 0, len(st.segments)),
+		Sources:     make([]*frameSrcJSON, len(st.sources)),
+		Corrections: make([]corrRecJSON, 0, len(st.corrections)),
 	}
 	for id, lm := range st.landmarks {
-		fd.Landmarks = append(fd.Landmarks, landmarkJSON{ID: id, X: lm.x, Y: lm.y, Count: lm.count})
+		fd.Landmarks = append(fd.Landmarks, landmarkJSON{
+			ID:          id,
+			X:           lm.x,
+			Y:           lm.y,
+			Count:       lm.count,
+			LegacyCount: lm.legacyCount,
+			LegacyMX:    lm.legacyMX,
+			LegacyMY:    lm.legacyMY,
+		})
 	}
 	for id, rec := range st.segments {
 		fd.Segments = append(fd.Segments, segmentJSON{ID: id, Hash: rec.hash, Result: rec.result})
+	}
+	for k, src := range st.sources {
+		if src == nil {
+			continue // 旧文件帧在新文件中保留为 null，表示仍无逐帧依据
+		}
+		obs := append([]Observation(nil), src.observations...)
+		fd.Sources[k] = &frameSrcJSON{MoveVariance: src.moveVariance, Observations: obs}
+	}
+	for _, rec := range st.corrections {
+		cj := corrRecJSON{
+			ID:        rec.ID,
+			Anchor:    rec.Anchor,
+			Target:    rec.Target,
+			EndTime:   rec.EndTime,
+			Poses:     make([]poseChangeJSON, len(rec.Poses)),
+			Landmarks: make([]landmarkChangeJSON, len(rec.Landmarks)),
+		}
+		for i, pc := range rec.Poses {
+			cj.Poses[i] = poseChangeJSON{Before: pc.Before, After: pc.After}
+		}
+		for i, lc := range rec.Landmarks {
+			cj.Landmarks[i] = landmarkChangeJSON{ID: lc.ID, Before: lc.Before, After: lc.After}
+		}
+		fd.Corrections = append(fd.Corrections, cj)
 	}
 	payload, err := json.Marshal(&fd)
 	if err != nil {
@@ -110,13 +177,33 @@ func loadFile(path string) (*mapState, error) {
 	}
 
 	st := &mapState{
-		config:     fd.Config,
-		trajectory: fd.Trajectory,
-		landmarks:  make(map[string]*landmarkState, len(fd.Landmarks)),
-		segments:   make(map[string]*segmentRecord, len(fd.Segments)),
+		config:      fd.Config,
+		trajectory:  fd.Trajectory,
+		landmarks:   make(map[string]*landmarkState, len(fd.Landmarks)),
+		segments:    make(map[string]*segmentRecord, len(fd.Segments)),
+		sources:     make([]*frameSource, len(fd.Trajectory)-1),
+		corrections: make([]*CorrectionRecord, 0, len(fd.Corrections)),
+		corrIndex:   make(map[string]string, len(fd.Corrections)),
 	}
+	// 旧文件不携带逐帧依据：有帧而 sources 缺省即旧地图。无帧时二者
+	// 无法区分也无需区分（尚无范围可校正）。
+	oldFormat := len(fd.Sources) == 0 && len(fd.Trajectory) > 1
 	for _, lm := range fd.Landmarks {
-		st.landmarks[lm.ID] = &landmarkState{x: lm.X, y: lm.Y, count: lm.Count}
+		legacyCount := lm.LegacyCount
+		legacyMX, legacyMY := lm.LegacyMX, lm.LegacyMY
+		// 旧文件中该路标的全部既有观测都是固定旧贡献，位置取文件中的聚合值。
+		if oldFormat {
+			legacyCount = lm.Count
+			legacyMX, legacyMY = lm.X, lm.Y
+		}
+		st.landmarks[lm.ID] = &landmarkState{
+			x:           lm.X,
+			y:           lm.Y,
+			count:       lm.Count,
+			legacyCount: legacyCount,
+			legacyMX:    legacyMX,
+			legacyMY:    legacyMY,
+		}
 	}
 	for _, sg := range fd.Segments {
 		ids := sg.Result.LandmarkIDs
@@ -127,6 +214,33 @@ func loadFile(path string) (*mapState, error) {
 			hash:   sg.Hash,
 			result: ImportResult{EndPose: sg.Result.EndPose, LandmarkIDs: ids},
 		}
+	}
+	if !oldFormat {
+		for k, src := range fd.Sources {
+			if src == nil {
+				continue // 来自旧文件的帧：保持依据缺失
+			}
+			obs := append([]Observation(nil), src.Observations...)
+			st.sources[k] = &frameSource{moveVariance: src.MoveVariance, observations: obs}
+		}
+	}
+	for _, cj := range fd.Corrections {
+		rec := &CorrectionRecord{
+			ID:        cj.ID,
+			Anchor:    cj.Anchor,
+			Target:    cj.Target,
+			EndTime:   cj.EndTime,
+			Poses:     make([]PoseChange, len(cj.Poses)),
+			Landmarks: make([]LandmarkChange, len(cj.Landmarks)),
+		}
+		for i, pc := range cj.Poses {
+			rec.Poses[i] = PoseChange{Before: pc.Before, After: pc.After}
+		}
+		for i, lc := range cj.Landmarks {
+			rec.Landmarks[i] = LandmarkChange{ID: lc.ID, Before: lc.Before, After: lc.After}
+		}
+		st.corrections = append(st.corrections, rec)
+		st.corrIndex[cj.ID] = canonicalCorrectionHash(cj.Anchor, cj.Target)
 	}
 	return st, nil
 }
@@ -143,10 +257,29 @@ func validateLoaded(fd *fileData) error {
 		// 配置不合法不可能由本版本写出。
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
+	// 新格式的逐帧依据必须与轨迹（除初始位姿外）一一对应；旧文件缺省
+	// 该字段（解码为 nil），数量为 0。
+	if len(fd.Sources) != 0 && len(fd.Sources) != len(fd.Trajectory)-1 {
+		return fmt.Errorf("%w: frame sources length %d for %d frames", ErrCorrupt, len(fd.Sources), len(fd.Trajectory)-1)
+	}
+	timeAt := func(t int64) bool {
+		for _, p := range fd.Trajectory {
+			if p.Time == t {
+				return true
+			}
+		}
+		return false
+	}
 	seenIDs := make(map[string]struct{}, len(fd.Landmarks))
 	for _, lm := range fd.Landmarks {
 		if lm.ID == "" || lm.Count < 1 || !isFinite(lm.X) || !isFinite(lm.Y) {
 			return fmt.Errorf("%w: invalid landmark record", ErrCorrupt)
+		}
+		if lm.LegacyCount < 0 || lm.LegacyCount > lm.Count {
+			return fmt.Errorf("%w: invalid legacy count for landmark %s", ErrCorrupt, lm.ID)
+		}
+		if lm.LegacyCount > 0 && (!isFinite(lm.LegacyMX) || !isFinite(lm.LegacyMY)) {
+			return fmt.Errorf("%w: invalid legacy mean for landmark %s", ErrCorrupt, lm.ID)
 		}
 		if _, dup := seenIDs[lm.ID]; dup {
 			return fmt.Errorf("%w: duplicate landmark %s", ErrCorrupt, lm.ID)
@@ -163,7 +296,43 @@ func validateLoaded(fd *fileData) error {
 		}
 		segIDs[sg.ID] = struct{}{}
 	}
+	corrIDs := make(map[string]struct{}, len(fd.Corrections))
+	for _, cr := range fd.Corrections {
+		if cr.ID == "" || !timeAt(cr.Anchor) || !timeAt(cr.EndTime) || cr.Anchor > cr.EndTime {
+			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
+		}
+		if len(cr.Poses) == 0 {
+			return fmt.Errorf("%w: correction %s has no affected poses", ErrCorrupt, cr.ID)
+		}
+		for _, pc := range cr.Poses {
+			if !finitePose(pc.Before) || !finitePose(pc.After) {
+				return fmt.Errorf("%w: correction %s has non-finite pose", ErrCorrupt, cr.ID)
+			}
+		}
+		if _, dup := corrIDs[cr.ID]; dup {
+			return fmt.Errorf("%w: duplicate correction %s", ErrCorrupt, cr.ID)
+		}
+		corrIDs[cr.ID] = struct{}{}
+	}
 	return nil
+}
+
+func finitePose(p Pose) bool {
+	return isFinite(p.X) && isFinite(p.Y) && isFinite(p.Heading) && isFinite(p.Variance)
+}
+
+// canonicalCorrectionHash 计算一次校正请求（锚点时间 + 目标位姿）的
+// 确定性指纹，用于同标识重复提交判定。直接按 IEEE-754 位编码。
+func canonicalCorrectionHash(anchor int64, tgt CorrectionTarget) string {
+	h := sha256.New()
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(anchor))
+	h.Write(b[:])
+	for _, v := range []float64{tgt.X, tgt.Y, tgt.Heading, tgt.Variance} {
+		binary.BigEndian.PutUint64(b[:], math.Float64bits(v))
+		h.Write(b[:])
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // saveExclusive 创建新文件，目标已存在即失败（O_EXCL）。
