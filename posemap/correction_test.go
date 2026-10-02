@@ -394,8 +394,9 @@ func TestCorrectionPersistRoundTrip(t *testing.T) {
 	}
 }
 
-// writeLegacyV1File 用当前状态构造一个去掉 sources/corrections 字段的
-// 旧版文件（二进制版本号仍为 1），模拟现网旧地图。
+// writeLegacyV1File 用当前状态构造一个去掉 sources/corrections 字段、并
+// 把路标历次出现压回旧版平铺字段的旧版文件（二进制版本号仍为 1），模拟
+// 现网旧地图。
 func writeLegacyV1File(t *testing.T, path string, st *mapState) {
 	t.Helper()
 	data, err := encodeFile(st)
@@ -408,6 +409,23 @@ func writeLegacyV1File(t *testing.T, path string, st *mapState) {
 	}
 	delete(raw, "sources")
 	delete(raw, "corrections")
+	if lms, ok := raw["landmarks"].([]any); ok {
+		for _, e := range lms {
+			lm, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			occs, ok := lm["occurrences"].([]any)
+			if !ok || len(occs) == 0 {
+				continue
+			}
+			first, _ := occs[0].(map[string]any)
+			lm["x"] = first["x"]
+			lm["y"] = first["y"]
+			lm["count"] = first["count"]
+			delete(lm, "occurrences")
+		}
+	}
 	payload, err := json.Marshal(raw)
 	if err != nil {
 		t.Fatal(err)

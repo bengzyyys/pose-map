@@ -19,13 +19,15 @@ type Map struct {
 
 // mapState 是地图的全部内存状态。
 type mapState struct {
-	config      Config
-	trajectory  []Pose // 按时间严格递增；trajectory[0] 为初始位姿
-	landmarks   map[string]*landmarkState
-	segments    map[string]*segmentRecord
-	sources     []*frameSource // sources[k] 对应 trajectory[k+1]；长度恒为 len(trajectory)-1
-	corrections []*CorrectionRecord
-	corrIndex   map[string]string // 校正标识 -> 首次内容指纹
+	config       Config
+	trajectory   []Pose // 按时间严格递增；trajectory[0] 为初始位姿
+	landmarks    map[string]*landmarkState
+	segments     map[string]*segmentRecord
+	sources      []*frameSource // sources[k] 对应 trajectory[k+1]；长度恒为 len(trajectory)-1
+	corrections  []*CorrectionRecord
+	corrIndex    map[string]string              // 校正标识 -> 首次内容指纹
+	invalRecords []*invalidationRecord          // 按提交次序的成功失效操作
+	invalIndex   map[string]*invalidationRecord // 失效标识 -> 首次记录
 }
 
 // frameSource 是生成某一帧的原始输入，供回环校正重放路标观测与累计
@@ -36,19 +38,55 @@ type frameSource struct {
 	observations []Observation
 }
 
-// landmarkState 是路标在地图坐标下的聚合状态。
+// landmarkState 是同一标识历次出现的聚合状态。appearances 按出现编号
+// 递增保存（编号即下标+1）；最后一次出现可能仍为当前有效记录，也可能
+// 已被失效。失效后的旧出现不参与新观测的合并；下一次出现从编号 1 起的
+// 全新记录开始，观测计数从 1 计起。
 //
 // legacy* 只用于打开不携带逐帧观测来源的旧文件：旧文件中每一帧的观测
-// 无法重放，因此旧文件里该路标的全部观测贡献视为固定的 legacyCount 次
-// 平均，不随后续校正改变；旧文件之后新导入且依据完整的观测再做增量
-// 平均。由本版本创建/导入的路标 legacyCount 为 0，全部观测均可重放。
+// 无法重放，因此旧文件第 1 次出现的全部观测贡献视为固定的 legacyCount
+// 次平均，不随后续校正改变；旧文件之后新导入且依据完整的观测再做增量
+// 平均。由本版本创建/导入的出现 legacyCount 为 0，全部观测均可重放。
 type landmarkState struct {
-	x           float64
-	y           float64
-	count       int
-	legacyCount int
-	legacyMX    float64
-	legacyMY    float64
+	appearances []*occurrenceState
+}
+
+// occurrenceState 是某一标识某一次出现的状态。
+type occurrenceState struct {
+	x             float64
+	y             float64
+	count         int
+	legacyCount   int
+	legacyMX      float64
+	legacyMY      float64
+	firstSeenTime int64 // 首次观测所在帧时间
+	hasFirstSeen  bool  // 旧文件缺少来源时为假
+	active        bool  // 是否为当前有效记录
+	invalidTime   int64 // 失效时间（提交时当前位姿时间）
+	invalidReason string
+	invalidOpID   string
+}
+
+// activeOccurrence 返回当前有效记录；不存在（从未出现或最近一次已失效）
+// 时返回 nil。
+func (lm *landmarkState) activeOccurrence() *occurrenceState {
+	if len(lm.appearances) == 0 {
+		return nil
+	}
+	last := lm.appearances[len(lm.appearances)-1]
+	if !last.active {
+		return nil
+	}
+	return last
+}
+
+// invalidationRecord 记录一次成功失效操作的首次内容与结果，供相同操作
+// 标识以相同原因、相同路标集合重复提交时直接返回。
+type invalidationRecord struct {
+	id     string
+	reason string
+	hash   string // 路标集合（排序后）的指纹
+	result InvalidationResult
 }
 
 // segmentRecord 记录一个已成功保存的段：内容指纹与首次导入结果，
@@ -72,11 +110,13 @@ func Create(path string, cfg Config) (*Map, error) {
 		return nil, err
 	}
 	st := &mapState{
-		config:     cfg,
-		trajectory: []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
-		landmarks:  make(map[string]*landmarkState),
-		segments:   make(map[string]*segmentRecord),
-		corrIndex:  make(map[string]string),
+		config:       cfg,
+		trajectory:   []Pose{{Time: cfg.InitialTime, X: cfg.InitialX, Y: cfg.InitialY, Heading: cfg.InitialHeading, Variance: cfg.InitialVariance}},
+		landmarks:    make(map[string]*landmarkState),
+		segments:     make(map[string]*segmentRecord),
+		corrIndex:    make(map[string]string),
+		invalRecords: nil,
+		invalIndex:   make(map[string]*invalidationRecord),
 	}
 	m := &Map{path: path, state: st}
 	// O_EXCL：目标已存在即失败，绝不当作新地图覆盖。
@@ -163,7 +203,13 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	cur := st.trajectory[len(st.trajectory)-1]
 	prevTime := cur.Time
 	newPoses := make([]Pose, 0, len(seg.Frames))
-	staged := make(map[string]*landmarkState) // 本段触及路标的暂存聚合
+	// staged 记录本帧触及路标的暂存“当前出现”副本：created 为真表示这是
+	// 本段内首次新观测产生的新出现（此前不存在当前有效记录）。
+	type stagedLM struct {
+		occ     *occurrenceState
+		created bool
+	}
+	staged := make(map[string]stagedLM) // 本段触及路标的暂存聚合
 	touched := make(map[string]struct{})
 
 	reject := func(kind string, frame int) (ImportResult, error) {
@@ -210,26 +256,40 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序处理。
 		for _, ob := range f.Observations {
 			mx, my := localToMap(cur.X, cur.Y, cur.Heading, ob.X, ob.Y)
-			lm := staged[ob.ID]
-			if lm == nil {
-				lm = st.landmarks[ob.ID]
-				if lm != nil {
-					// 复制已提交路标，避免提前修改真实状态。
-					cp := *lm
-					lm = &cp
+			s, seen := staged[ob.ID]
+			if !seen {
+				if lm := st.landmarks[ob.ID]; lm != nil {
+					if active := lm.activeOccurrence(); active != nil {
+						// 复制当前有效出现，避免提前修改真实状态。旧出现
+						// （已失效）永不参与新观测的合并。
+						cp := *active
+						s = stagedLM{occ: &cp, created: false}
+					}
 				}
-			}
-			if lm != nil {
-				if math.Hypot(mx-lm.x, my-lm.y) > m.state.config.MergeDistance {
-					return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+				if s.occ == nil {
+					// 从未出现或最近一次已失效：本次为新的一次出现，
+					// 编号在提交时确定，观测计数从 1 开始。
+					s = stagedLM{
+						occ: &occurrenceState{
+							x: mx, y: my, count: 1,
+							firstSeenTime: f.Time, hasFirstSeen: true,
+							active: true,
+						},
+						created: true,
+					}
+					staged[ob.ID] = s
+					touched[ob.ID] = struct{}{}
+					continue
 				}
-				lm.x = (lm.x*float64(lm.count) + mx) / float64(lm.count+1)
-				lm.y = (lm.y*float64(lm.count) + my) / float64(lm.count+1)
-				lm.count++
-			} else {
-				lm = &landmarkState{x: mx, y: my, count: 1}
+				staged[ob.ID] = s
 			}
-			staged[ob.ID] = lm
+			occ := s.occ
+			if math.Hypot(mx-occ.x, my-occ.y) > m.state.config.MergeDistance {
+				return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+			}
+			occ.x = (occ.x*float64(occ.count) + mx) / float64(occ.count+1)
+			occ.y = (occ.y*float64(occ.count) + my) / float64(occ.count+1)
+			occ.count++
 			touched[ob.ID] = struct{}{}
 		}
 
@@ -255,14 +315,30 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	trajLenBefore := len(st.trajectory)
 	srcLenBefore := len(st.sources)
 	type undoLandmark struct {
-		lm *landmarkState
-		ok bool
+		lm       *landmarkState
+		ok       bool
+		created  bool
+		replaced *occurrenceState // 非新建时被暂存副本替换掉的原当前出现
 	}
 	undo := make(map[string]undoLandmark, len(staged))
-	for id, nl := range staged {
+	for id, s := range staged {
 		old, ok := st.landmarks[id]
-		undo[id] = undoLandmark{old, ok}
-		st.landmarks[id] = nl
+		if s.created {
+			// 新的一次出现：可能是该标识的首次出现，也可能接在已失效的
+			// 历次出现之后。编号即追加后的切片长度。
+			lm := old
+			if lm == nil {
+				lm = &landmarkState{}
+			}
+			lm.appearances = append(lm.appearances, s.occ)
+			st.landmarks[id] = lm
+			undo[id] = undoLandmark{lm: old, ok: ok, created: true}
+		} else {
+			// 更新既有当前有效出现（暂存副本替换原指针，旧出现原样保留）。
+			replaced := old.appearances[len(old.appearances)-1]
+			old.appearances[len(old.appearances)-1] = s.occ
+			undo[id] = undoLandmark{lm: old, ok: ok, created: false, replaced: replaced}
+		}
 	}
 	st.trajectory = append(st.trajectory, newPoses...)
 	st.sources = append(st.sources, newSources...)
@@ -272,10 +348,13 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		st.trajectory = st.trajectory[:trajLenBefore]
 		st.sources = st.sources[:srcLenBefore]
 		for id, u := range undo {
-			if u.ok {
-				st.landmarks[id] = u.lm
-			} else {
+			switch {
+			case !u.ok:
 				delete(st.landmarks, id)
+			case u.created:
+				u.lm.appearances = u.lm.appearances[:len(u.lm.appearances)-1]
+			default:
+				u.lm.appearances[len(u.lm.appearances)-1] = u.replaced
 			}
 		}
 		delete(st.segments, seg.ID)
@@ -323,8 +402,9 @@ type Rect struct {
 	MinX, MinY, MaxX, MaxY float64
 }
 
-// LandmarksInRect 返回矩形（含边界）内的路标及观测次数，按标识排序；
-// 区域为空时返回非 nil 的空切片。上下界颠倒或含非有限值时报 ErrInvalidRect。
+// LandmarksInRect 返回矩形（含边界）内当前仍有效路标的最新一次出现及
+// 观测次数，按标识排序；已失效（且尚未再次出现）的路标立即排除，区域为
+// 空时返回非 nil 的空切片。上下界颠倒或含非有限值时报 ErrInvalidRect。
 func (m *Map) LandmarksInRect(r Rect) ([]Landmark, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -337,8 +417,12 @@ func (m *Map) LandmarksInRect(r Rect) ([]Landmark, error) {
 	}
 	var out []Landmark
 	for id, lm := range m.state.landmarks {
-		if lm.x >= r.MinX && lm.x <= r.MaxX && lm.y >= r.MinY && lm.y <= r.MaxY {
-			out = append(out, Landmark{ID: id, X: lm.x, Y: lm.y, Count: lm.count})
+		occ := lm.activeOccurrence()
+		if occ == nil {
+			continue // 最近一次出现已失效：立即排除。
+		}
+		if occ.x >= r.MinX && occ.x <= r.MaxX && occ.y >= r.MinY && occ.y <= r.MaxY {
+			out = append(out, Landmark{ID: id, X: occ.x, Y: occ.y, Count: occ.count})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })

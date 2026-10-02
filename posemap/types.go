@@ -65,6 +65,50 @@ type Landmark struct {
 	Count int
 }
 
+// Invalidation 是一次路标失效操作：非空操作标识、非空原因与一组非空、
+// 不重复的路标标识。提交时这些路标的当前有效记录同时失效，失效时间取
+// 提交时的当前位姿时间。
+type Invalidation struct {
+	ID        string   // 操作标识，非空
+	Reason    string   // 失效原因，非空
+	Landmarks []string // 路标标识，非空且不重复
+}
+
+// InvalidationResult 是一次成功失效操作的结果：失效时间（提交时的当前
+// 位姿时间）以及每个被撤下路标的标识与其失效的出现编号。
+type InvalidationResult struct {
+	Time      int64
+	Landmarks []InvalidatedLandmark
+}
+
+// InvalidatedLandmark 记录一个被撤下路标的标识与被失效记录的出现编号。
+type InvalidatedLandmark struct {
+	ID         string
+	Occurrence int
+}
+
+// Appearance 是同一标识某一次出现的记录：出现编号（同一标识首次出现为
+// 1，每次失效后再次出现递增）、位置、观测计数、是否仍为当前有效记录、
+// 首次观测时间，以及失效时间与原因。仍有效（Active 为真）时失效时间与
+// 原因没有意义；旧文件缺少逐帧来源时 HasFirstSeen 为假，首次观测时间
+// 未知。
+type Appearance struct {
+	Number        int // 出现编号，从 1 开始
+	Landmark      Landmark
+	Active        bool  // 是否为当前有效记录
+	FirstSeenTime int64 // 首次观测所在帧的时间
+	HasFirstSeen  bool  // 旧文件缺少逐帧来源时为假，表示首次观测时间未知
+	InvalidTime   int64 // 失效时间（提交失效时的当前位姿时间）
+	InvalidReason string
+	InvalidOpID   string
+}
+
+// LandmarkHistory 是同一标识按出现编号递增排列的全部出现记录。
+type LandmarkHistory struct {
+	ID          string
+	Appearances []Appearance
+}
+
 // CorrectionTarget 是已确认回环提交的目标：某个已保存帧应有的位姿与
 // 非负位置方差。位置单位为米，朝向单位为弧度。
 type CorrectionTarget struct {
@@ -88,11 +132,13 @@ type PoseChange struct {
 	After  Pose
 }
 
-// LandmarkChange 是一个路标的校正前后值（观测次数不变）。
+// LandmarkChange 是一个路标某一次出现的校正前后值（观测次数不变）。
+// Occurrence 给出受影响的出现编号；同一标识的不同出现分别记录。
 type LandmarkChange struct {
-	ID     string
-	Before Landmark
-	After  Landmark
+	ID         string
+	Occurrence int
+	Before     Landmark
+	After      Landmark
 }
 
 // CorrectionRecord 是一次成功校正按提交次序保留的记录。后续校正可
@@ -103,25 +149,30 @@ type CorrectionRecord struct {
 	Target    CorrectionTarget // 提交目标
 	EndTime   int64            // 受影响末帧时间（提交时的末帧）
 	Poses     []PoseChange     // 受影响位姿的校正前后值，按时间升序
-	Landmarks []LandmarkChange // 受影响路标的校正前后值，按标识排序
+	Landmarks []LandmarkChange // 受影响路标出现的校正前后值，按标识再按出现编号升序
 }
 
-// RejectError 表示一次段导入或回环校正因语义不合法而被整体拒绝。
+// RejectError 表示一次段导入、路标失效或回环校正因语义不合法而被整体
+// 拒绝。
 //
 // Kind 为可区分的拒绝原因（见 Reject* 常量）；当原因涉及具体帧时，
 // Frame 给出从零开始的帧序号且 HasFrame 为真；路标冲突时 Landmark
 // 给出涉及的路标标识；重复段内容冲突时 Landmark 给出冲突的段标识。
 // 两种情况下 HasLandmark 均为真。校正类原因用 Time 给出提交的锚点
 // 时间且 HasTime 为真；校正中路标冲突时 Time 改为给出冲突观测所在帧的
-// 时间、Landmark 给出路标标识，HasLandmark 为真。
+// 时间、Landmark 给出路标标识、Occurrence 给出冲突的出现编号（1 起），
+// HasLandmark 与 HasOccurrence 均为真。失效操作中找不到路标或路标当前
+// 已失效时，Landmark 给出路标标识。
 type RejectError struct {
-	Kind        string
-	Frame       int
-	HasFrame    bool
-	Landmark    string
-	HasLandmark bool
-	Time        int64
-	HasTime     bool
+	Kind          string
+	Frame         int
+	HasFrame      bool
+	Landmark      string
+	HasLandmark   bool
+	Time          int64
+	HasTime       bool
+	Occurrence    int
+	HasOccurrence bool
 }
 
 func (e *RejectError) Error() string {
@@ -132,7 +183,19 @@ func (e *RejectError) Error() string {
 		if e.HasFrame {
 			return "posemap: frame " + strconv.Itoa(e.Frame) + " has empty landmark id"
 		}
-		return "posemap: empty segment or correction id"
+		return "posemap: empty segment, correction or invalidation id"
+	case RejectEmptyReason:
+		return "posemap: invalidation reason is empty"
+	case RejectEmptyLandmarkList:
+		return "posemap: invalidation landmark list is empty"
+	case RejectDuplicateLandmarkEntry:
+		return "posemap: invalidation lists landmark " + e.Landmark + " more than once"
+	case RejectLandmarkNotFound:
+		return "posemap: landmark " + e.Landmark + " not found"
+	case RejectLandmarkInactive:
+		return "posemap: landmark " + e.Landmark + " has no active occurrence"
+	case RejectInvalidationMismatch:
+		return "posemap: invalidation id " + e.Landmark + " already saved with different content"
 	case RejectNegativeVariance:
 		if e.HasTime {
 			return "posemap: correction target variance is negative"
@@ -155,6 +218,9 @@ func (e *RejectError) Error() string {
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " exceeds the maximum time interval"
 	case RejectLandmarkConflict:
 		if e.HasTime {
+			if e.HasOccurrence {
+				return "posemap: correction conflicts landmark " + e.Landmark + " occurrence " + strconv.Itoa(e.Occurrence) + " at frame time " + strconv.FormatInt(e.Time, 10)
+			}
 			return "posemap: correction conflicts landmark " + e.Landmark + " at frame time " + strconv.FormatInt(e.Time, 10)
 		}
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " observation of landmark " + e.Landmark + " is beyond merge distance"
@@ -173,17 +239,23 @@ func (e *RejectError) Error() string {
 
 // 可区分的拒绝原因。
 const (
-	RejectEmptySegment       = "empty_segment"       // 空批次
-	RejectEmptyID            = "empty_id"            // 空段/路标/校正标识
-	RejectNegativeVariance   = "negative_variance"   // 负运动方差或负目标方差
-	RejectNonFinite          = "non_finite"          // 非有限数值（NaN/Inf）
-	RejectTimeOrder          = "time_order"          // 时间未严格递增或首帧不够晚
-	RejectInterval           = "interval_exceeded"   // 相邻位姿间隔超过上限
-	RejectLandmarkConflict   = "landmark_conflict"   // 同标识路标超出合并距离
-	RejectDuplicateMismatch  = "duplicate_mismatch"  // 同一段标识对应不同内容
-	RejectAnchorNotFound     = "anchor_not_found"    // 校正锚点未命中已导入帧
-	RejectCorrectionMismatch = "correction_mismatch" // 同一校正标识对应不同内容
-	RejectNoBasis            = "no_basis"            // 旧地图缺少逐帧观测来源
+	RejectEmptySegment           = "empty_segment"            // 空批次
+	RejectEmptyID                = "empty_id"                 // 空段/路标/校正/失效标识
+	RejectEmptyReason            = "empty_reason"             // 失效原因为空
+	RejectEmptyLandmarkList      = "empty_landmark_list"      // 失效路标列表为空
+	RejectDuplicateLandmarkEntry = "duplicate_landmark_entry" // 失效列表中路标重复
+	RejectLandmarkNotFound       = "landmark_not_found"       // 失效的路标从未出现
+	RejectLandmarkInactive       = "landmark_inactive"        // 失效的路标当前无有效记录
+	RejectInvalidationMismatch   = "invalidation_mismatch"    // 同一失效标识对应不同内容
+	RejectNegativeVariance       = "negative_variance"        // 负运动方差或负目标方差
+	RejectNonFinite              = "non_finite"               // 非有限数值（NaN/Inf）
+	RejectTimeOrder              = "time_order"               // 时间未严格递增或首帧不够晚
+	RejectInterval               = "interval_exceeded"        // 相邻位姿间隔超过上限
+	RejectLandmarkConflict       = "landmark_conflict"        // 同标识路标超出合并距离
+	RejectDuplicateMismatch      = "duplicate_mismatch"       // 同一段标识对应不同内容
+	RejectAnchorNotFound         = "anchor_not_found"         // 校正锚点未命中已导入帧
+	RejectCorrectionMismatch     = "correction_mismatch"      // 同一校正标识对应不同内容
+	RejectNoBasis                = "no_basis"                 // 旧地图缺少逐帧观测来源
 )
 
 // 哨兵错误，供 errors.Is 使用。
@@ -196,6 +268,8 @@ var (
 	ErrInvalidRect = errors.New("posemap: invalid rectangle")
 	// ErrNotFound 在查询时间早于初始时间（无任何不晚于它的位姿）时返回。
 	ErrNotFound = errors.New("posemap: pose not found")
+	// ErrLandmarkNotFound 在按标识查询路标历次出现而该标识从未出现时返回。
+	ErrLandmarkNotFound = errors.New("posemap: landmark not found")
 	// ErrCorrupt 在数据文件损坏、截断或校验失败时返回。
 	ErrCorrupt = errors.New("posemap: corrupt data file")
 	// ErrUnsupportedVersion 在数据文件格式版本不受支持时返回。

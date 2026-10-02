@@ -99,56 +99,91 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		next[j] = np
 	}
 
-	// 受影响路标：在受影响帧中被观测到的全部路标。
-	affected := make(map[string]struct{})
+	// occKey 标识某一路标的某一次出现。回环校正跨越同一路标的多次出现
+	// 时，各次出现分别聚合、分别遵守合并距离限制。
+	type occKey struct {
+		id  string
+		num int
+	}
+
+	// occAt 把时间 t 的一次观测归入当时的当前出现：各次出现的时间区间
+	// （首次观测时间 .. 失效时间）互不重叠。旧文件的第 1 次出现缺少逐帧
+	// 来源（hasFirstSeen 为假），覆盖最早的全部历史帧。
+	occAt := func(id string, t int64) int {
+		lm := st.landmarks[id]
+		for i, o := range lm.appearances {
+			if o.hasFirstSeen && o.firstSeenTime > t {
+				continue
+			}
+			if !o.active && o.invalidTime < t {
+				continue
+			}
+			return i + 1
+		}
+		return 0 // 不变量：已接受观测必然属于某次出现
+	}
+
+	// 受影响的路标出现：在受影响帧中被观测到的全部（标识，出现编号）。
+	affected := make(map[occKey]struct{})
 	for j := anchorIdx; j <= end; j++ {
+		t := st.trajectory[j].Time
 		for _, ob := range st.sources[j-1].observations {
-			affected[ob.ID] = struct{}{}
+			affected[occKey{id: ob.ID, num: occAt(ob.ID, t)}] = struct{}{}
 		}
 	}
-	affectedIDs := make([]string, 0, len(affected))
-	for id := range affected {
-		affectedIDs = append(affectedIDs, id)
+	affectedKeys := make([]occKey, 0, len(affected))
+	for k := range affected {
+		affectedKeys = append(affectedKeys, k)
 	}
-	sort.Strings(affectedIDs)
+	sort.Slice(affectedKeys, func(i, j int) bool {
+		if affectedKeys[i].id != affectedKeys[j].id {
+			return affectedKeys[i].id < affectedKeys[j].id
+		}
+		return affectedKeys[i].num < affectedKeys[j].num
+	})
 
-	// 逐路标运行聚合：旧文件的既有观测作为固定“旧贡献”起点（位置不
-	// 随校正改变），其余观测按帧时间与同帧输入次序、以当前/校正后位姿
-	// 重放，完整复刻导入时的增量平均与合并距离判定。
+	// 逐“出现”运行聚合：旧文件第 1 次出现的既有观测作为固定“旧贡献”
+	// 起点（位置不随校正改变），其余观测按帧时间与同帧输入次序、以当前/
+	// 校正后位姿重放，完整复刻导入时的增量平均与合并距离判定。同一路标的
+	// 不同出现互不参与彼此的合并。
 	type agg struct {
 		count int
 		x, y  float64
 	}
-	aggs := make(map[string]*agg, len(affectedIDs))
-	for _, id := range affectedIDs {
-		lm := st.landmarks[id]
+	aggs := make(map[occKey]*agg, len(affectedKeys))
+	for _, k := range affectedKeys {
+		occ := st.landmarks[k.id].appearances[k.num-1]
 		a := &agg{}
-		if lm != nil && lm.legacyCount > 0 {
-			a.count = lm.legacyCount
-			a.x = lm.legacyMX
-			a.y = lm.legacyMY
+		if occ.legacyCount > 0 {
+			a.count = occ.legacyCount
+			a.x = occ.legacyMX
+			a.y = occ.legacyMY
 		}
-		aggs[id] = a
+		aggs[k] = a
 	}
 	for j := 1; j <= end; j++ {
 		src := st.sources[j-1]
 		if src == nil {
-			continue // 旧文件帧：观测已计入各路标 legacy 起点
+			continue // 旧文件帧：观测已计入对应出现的 legacy 起点
 		}
 		pose := next[j]
+		t := st.trajectory[j].Time
 		for _, ob := range src.observations {
-			a, ok := aggs[ob.ID]
+			k := occKey{id: ob.ID, num: occAt(ob.ID, t)}
+			a, ok := aggs[k]
 			if !ok {
 				continue
 			}
 			mx, my := localToMap(pose.X, pose.Y, pose.Heading, ob.X, ob.Y)
 			if a.count > 0 && math.Hypot(mx-a.x, my-a.y) > st.config.MergeDistance {
 				return CorrectionRecord{}, &RejectError{
-					Kind:        RejectLandmarkConflict,
-					Time:        st.trajectory[j].Time,
-					HasTime:     true,
-					Landmark:    ob.ID,
-					HasLandmark: true,
+					Kind:          RejectLandmarkConflict,
+					Time:          st.trajectory[j].Time,
+					HasTime:       true,
+					Landmark:      ob.ID,
+					HasLandmark:   true,
+					Occurrence:    k.num,
+					HasOccurrence: true,
 				}
 			}
 			a.x = (a.x*float64(a.count) + mx) / float64(a.count+1)
@@ -156,11 +191,13 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 			a.count++
 		}
 	}
-	for id, a := range aggs {
+	for _, k := range affectedKeys {
+		a := aggs[k]
+		occ := st.landmarks[k.id].appearances[k.num-1]
 		if !isFinite(a.x) || !isFinite(a.y) {
 			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
 		}
-		if lm := st.landmarks[id]; lm == nil || a.count != lm.count {
+		if a.count != occ.count {
 			// 内存不变量被破坏不可能由本包写出，按损坏处理而非半提交。
 			return CorrectionRecord{}, ErrCorrupt
 		}
@@ -173,50 +210,48 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		Target:    tgt,
 		EndTime:   st.trajectory[end].Time,
 		Poses:     make([]PoseChange, 0, end-anchorIdx+1),
-		Landmarks: make([]LandmarkChange, 0, len(affectedIDs)),
+		Landmarks: make([]LandmarkChange, 0, len(affectedKeys)),
 	}
 	for j := anchorIdx; j <= end; j++ {
 		rec.Poses = append(rec.Poses, PoseChange{Before: st.trajectory[j], After: next[j]})
 	}
-	for _, id := range affectedIDs {
-		lm := st.landmarks[id]
-		a := aggs[id]
+	for _, k := range affectedKeys {
+		occ := st.landmarks[k.id].appearances[k.num-1]
+		a := aggs[k]
 		rec.Landmarks = append(rec.Landmarks, LandmarkChange{
-			ID:     id,
-			Before: Landmark{ID: id, X: lm.x, Y: lm.y, Count: lm.count},
-			After:  Landmark{ID: id, X: a.x, Y: a.y, Count: a.count},
+			ID:         k.id,
+			Occurrence: k.num,
+			Before:     Landmark{ID: k.id, X: occ.x, Y: occ.y, Count: occ.count},
+			After:      Landmark{ID: k.id, X: a.x, Y: a.y, Count: a.count},
 		})
 	}
 
 	// ---- 全部校验通过：暂存提交并落盘；落盘失败精确回滚 ----
 	oldTraj := append([]Pose(nil), st.trajectory...)
-	type lmSnapshot struct {
-		x, y               float64
-		count, legacyCount int
-		legacyMX, legacyMY float64
+	type occSnapshot struct {
+		key  occKey
+		occ  *occurrenceState
+		x, y float64
 	}
-	oldLM := make(map[string]lmSnapshot, len(affectedIDs))
-	for _, id := range affectedIDs {
-		lm := st.landmarks[id]
-		oldLM[id] = lmSnapshot{lm.x, lm.y, lm.count, lm.legacyCount, lm.legacyMX, lm.legacyMY}
+	oldOcc := make([]occSnapshot, 0, len(affectedKeys))
+	for _, k := range affectedKeys {
+		occ := st.landmarks[k.id].appearances[k.num-1]
+		oldOcc = append(oldOcc, occSnapshot{key: k, occ: occ, x: occ.x, y: occ.y})
 	}
 	oldCorrLen := len(st.corrections)
 
 	st.trajectory = next
-	for _, id := range affectedIDs {
-		a := aggs[id]
-		lm := st.landmarks[id]
-		lm.x, lm.y = a.x, a.y
+	for _, s := range oldOcc {
+		a := aggs[s.key]
+		s.occ.x, s.occ.y = a.x, a.y
 	}
 	st.corrections = append(st.corrections, rec)
 	st.corrIndex[req.ID] = canonicalCorrectionHash(req.Anchor, tgt)
 
 	if err := m.saveReplace(); err != nil {
 		st.trajectory = oldTraj
-		for id, s := range oldLM {
-			lm := st.landmarks[id]
-			lm.x, lm.y, lm.count = s.x, s.y, s.count
-			lm.legacyCount, lm.legacyMX, lm.legacyMY = s.legacyCount, s.legacyMX, s.legacyMY
+		for _, s := range oldOcc {
+			s.occ.x, s.occ.y = s.x, s.y
 		}
 		st.corrections = st.corrections[:oldCorrLen]
 		delete(st.corrIndex, req.ID)
