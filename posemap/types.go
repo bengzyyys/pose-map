@@ -288,6 +288,23 @@ func normalizeAngle(a float64) float64 {
 // isFinite 判断数值既不是 NaN 也不是 Inf。
 func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
+// intervalExceedsLimit 判断严格递增的两个有符号 int64 毫秒时间之间的
+// 真实间隔是否超过 limit（正数）。调用方须保证 later > earlier（时间
+// 相等或倒退由 time_order 单独拒绝）。later-earlier 在数学上恒为正，
+// 但跨正负的大跨度会超出 int64 表示范围，直接相减会回绕成负值而放过
+// 大缺口；这里在不触发整数溢出的前提下完成比较：later > earlier+limit
+// 与 later-earlier > limit 数学等价，仅在 earlier+limit 上溢时才会
+// 出现反例，而那种情况下真实间隔必然已超过 limit。
+func intervalExceedsLimit(later, earlier, limit int64) bool {
+	if later <= earlier {
+		return false // 非严格递增不属于间隔超限，交由调用方按 time_order 处理。
+	}
+	if earlier > math.MaxInt64-limit {
+		return true // earlier+limit 上溢：真实间隔（later>earlier）必然超限。
+	}
+	return later > earlier+limit
+}
+
 // mergeMean 把一个新样本 v 并入既有等权均值（已有 count 个样本），
 // 返回 count+1 个样本的均值。与 (mean*count + v)/(count+1) 数学等价，
 // 但按 mean + (v-mean)/(count+1) 计算：大数值坐标下 mean*count 会溢出
