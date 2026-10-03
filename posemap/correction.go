@@ -186,8 +186,8 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 					HasOccurrence: true,
 				}
 			}
-			a.x = (a.x*float64(a.count) + mx) / float64(a.count+1)
-			a.y = (a.y*float64(a.count) + my) / float64(a.count+1)
+			a.x = mergeMean(a.x, mx, a.count)
+			a.y = mergeMean(a.y, my, a.count)
 			a.count++
 		}
 	}
