@@ -249,3 +249,132 @@ func TestOpenLegacySourcesStillChecked(t *testing.T) {
 		t.Fatalf("appended bad source: err = %v, want ErrCorrupt, map=%v", err, m)
 	}
 }
+
+// 第一次出现的失效时间（350）晚于第二次出现的首次观测（300）：两次出现
+// 的时间范围重叠，t=300 的观测同时被两次出现接纳。即使重叠范围内的观测
+// 各自都能归入某次出现，出现记录本身的时间关系已矛盾，打开必须拒绝。
+func TestOpenRejectsOverlappingOccurrences(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.pose")
+	buildOccurrenceMap(t, path)
+	fd := readFileData(t, path)
+	fd.Landmarks[0].Occurrences[0].InvalidTime = 350
+	writeFileDataRaw(t, path, &fd)
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := Open(path)
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+	if m != nil {
+		t.Fatalf("Open returned usable map: %v", m)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(saved) {
+		t.Fatal("Open modified the rejected file")
+	}
+}
+
+// 第二次出现的首次观测与第一次出现的失效时间相等：两个端点都接纳所在
+// 时刻的观测，该时刻的观测归属歧义，同样拒绝。
+func TestOpenRejectsTouchingOccurrenceBounds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.pose")
+	buildOccurrenceMap(t, path)
+	fd := readFileData(t, path)
+	// occ1 在 200 失效；把 occ2 的首次观测改为 200，两端点相等。
+	fd.Landmarks[0].Occurrences[1].FirstSeenTime = 200
+	writeFileDataRaw(t, path, &fd)
+
+	if m, err := Open(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("touching bounds: err = %v, want ErrCorrupt, map=%v", err, m)
+	}
+}
+
+// 已失效出现的首次观测时间晚于其失效时间：记录自身矛盾。
+func TestOpenRejectsFirstSeenAfterInvalidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.pose")
+	buildOccurrenceMap(t, path)
+	fd := readFileData(t, path)
+	fd.Landmarks[0].Occurrences[0].FirstSeenTime = 250 // 失效时间为 200
+	writeFileDataRaw(t, path, &fd)
+
+	if m, err := Open(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("first seen after invalidation: err = %v, want ErrCorrupt, map=%v", err, m)
+	}
+}
+
+// 第二次及以后出现的首次观测时间未知：只有旧文件的第 1 次出现允许未知。
+func TestOpenRejectsLaterOccurrenceWithoutFirstSeen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.pose")
+	buildOccurrenceMap(t, path)
+	fd := readFileData(t, path)
+	fd.Landmarks[0].Occurrences[1].HasFirstSeen = false
+	fd.Landmarks[0].Occurrences[1].FirstSeenTime = 0
+	writeFileDataRaw(t, path, &fd)
+
+	if m, err := Open(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("later occurrence without first seen: err = %v, want ErrCorrupt, map=%v", err, m)
+	}
+}
+
+// 旧地图兼容：旧文件第 1 次出现首次观测时间未知，失效后再次出现仍须
+// 遵守时间次序；次序合法的此类历史必须正常打开，且记录原样保留。
+func TestOpenLegacyInvalidatedThenReappeared(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.pose")
+	cfg := Config{InitialTime: 0, MaxInterval: 1000, MergeDistance: 1.0}
+	m, err := Create(path, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ImportSegment(Segment{ID: "old", Frames: []Frame{
+		{Time: 100, DX: 1, Observations: []Observation{{ID: "K"}}},
+		{Time: 200, DX: 1, Observations: []Observation{{ID: "K"}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	writeLegacyV1File(t, path, m.state)
+	m.Close()
+
+	m2, err := Open(path)
+	if err != nil {
+		t.Fatalf("open legacy: %v", err)
+	}
+	if _, err := m2.Invalidate(Invalidation{ID: "op1", Reason: "gone", Landmarks: []string{"K"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m2.ImportSegment(Segment{ID: "new", Frames: []Frame{
+		{Time: 300, DX: 0.5, Observations: []Observation{{ID: "K"}}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第 1 次出现首次观测时间未知、失效时间 200；第 2 次出现 300 首次
+	// 观测。次序合法，必须打开成功且记录原样保留。
+	m3, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen legacy history: %v", err)
+	}
+	defer m3.Close()
+	h, err := m3.LandmarkAppearances("K")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Appearances) != 2 {
+		t.Fatalf("appearances = %+v", h.Appearances)
+	}
+	a1, a2 := h.Appearances[0], h.Appearances[1]
+	if a1.Active || a1.HasFirstSeen || a1.InvalidTime != 200 {
+		t.Fatalf("occ1 = %+v", a1)
+	}
+	if !a2.Active || !a2.HasFirstSeen || a2.FirstSeenTime != 300 {
+		t.Fatalf("occ2 = %+v", a2)
+	}
+}

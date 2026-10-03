@@ -437,6 +437,28 @@ func validateLoaded(fd *fileData) error {
 			} else if oj.InvalidReason == "" {
 				return fmt.Errorf("%w: invalidated occurrence %d of landmark %s lacks reason", ErrCorrupt, oj.Number, lm.ID)
 			}
+			// 各次出现接纳观测的时间范围必须与出现编号的先后次序一致，
+			// 否则同一时刻可能被两次出现同时接纳（归属歧义），回环校正
+			// 会把后来的观测归入较早记录。首次观测与失效两个端点都接纳
+			// 所在时刻的观测，因此下一次出现必须严格晚于上一次失效才
+			// 开始，时间相等也算重叠。这些检查针对出现记录本身，与重叠
+			// 范围内当前是否有观测无关。
+			if i > 0 && !oj.HasFirstSeen {
+				// 只有旧文件的第 1 次出现允许首次观测时间未知；第 2 次
+				// 及以后的出现由本版本导入产生，必然记录首次观测时间。
+				return fmt.Errorf("%w: occurrence %d of landmark %s lacks first seen time", ErrCorrupt, oj.Number, lm.ID)
+			}
+			if !oj.Active && oj.HasFirstSeen && oj.FirstSeenTime > oj.InvalidTime {
+				return fmt.Errorf("%w: occurrence %d of landmark %s first seen after its invalidation", ErrCorrupt, oj.Number, lm.ID)
+			}
+			if i > 0 {
+				// 上一次出现必已失效（有效出现必须是最后一次，上面已
+				// 检查）；本次出现的首次观测时间已知（上面已检查）。
+				prev := lm.Occurrences[i-1]
+				if oj.FirstSeenTime <= prev.InvalidTime {
+					return fmt.Errorf("%w: occurrence %d of landmark %s overlaps previous occurrence", ErrCorrupt, oj.Number, lm.ID)
+				}
+			}
 		}
 		if activeCount > 1 {
 			return fmt.Errorf("%w: multiple active occurrences for landmark %s", ErrCorrupt, lm.ID)
