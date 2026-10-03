@@ -383,6 +383,22 @@ func validateLoaded(fd *fileData) error {
 		// 配置不合法不可能由本版本写出。
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
+	// 保存的整条轨迹（初始位姿与全部已导入帧，段内与相邻段之间同样适用）
+	// 必须与导入时遵守相同的时间规则：后续位姿时间严格递增，相邻间隔不超过
+	// 配置上限（恰好等于上限合法）。否则按时间查询失去可靠的先后依据，按
+	// 损坏拒绝，而不是当成一次新轨迹导入返回帧拒绝结果。时间为有符号 int64
+	// 毫秒且允许负值；prev 接近 math.MinInt64 而 cur 为正时有符号差值会溢出
+	// 回绕成负数，这里已保证 cur > prev、真实差值落在 [1, 2^64-1]，用无符号
+	// 减法得到精确的数学差值再与上限比较（MaxInterval 已校验为正）。
+	for i := 1; i < len(fd.Trajectory); i++ {
+		prev, cur := fd.Trajectory[i-1].Time, fd.Trajectory[i].Time
+		if cur <= prev {
+			return fmt.Errorf("%w: pose time %d is not strictly after previous time %d", ErrCorrupt, cur, prev)
+		}
+		if uint64(cur)-uint64(prev) > uint64(fd.Config.MaxInterval) {
+			return fmt.Errorf("%w: pose time %d exceeds max interval %d after previous time %d", ErrCorrupt, cur, fd.Config.MaxInterval, prev)
+		}
+	}
 	// 新格式的逐帧依据必须与轨迹（除初始位姿外）一一对应；旧文件缺省
 	// 该字段（解码为 nil），数量为 0。
 	if len(fd.Sources) != 0 && len(fd.Sources) != len(fd.Trajectory)-1 {
