@@ -443,37 +443,15 @@ func validateLoaded(fd *fileData) error {
 		}
 	}
 	// 校验每条带逐帧依据的观测来源：观测路标必须存在，且所在帧时间必须
-	// 落入该路标某一次出现的区间——有首次观测时间的出现只包含不早于该
-	// 时间的观测（端点包含），已失效出现只包含不晚于失效时间的观测
-	// （端点包含），仍有效出现无下界之后的限制。旧出现已失效不代表其
-	// 历史观测无效；同一标识两次出现之间（如 200 失效、300 再现时的
-	// 250 帧）的观测没有归属，按损坏拒绝。null 帧来自缺少逐帧依据的
-	// 旧地图，其观测不在这里（也无法）核验；旧版平铺路标视为一次无
-	// 边界的有效出现，因此旧地图后来追加的来源帧仍按此规则检查。
+	// 落入该路标某一次出现的时间边界（共享规则见 occurrence.go）。旧出现
+	// 已失效不代表其历史观测无效；同一标识两次出现之间（如 200 失效、
+	// 300 再现时的 250 帧）的观测没有归属，按损坏拒绝。null 帧来自缺少
+	// 逐帧依据的旧地图，其观测不在这里（也无法）核验；旧版平铺路标视为
+	// 一次无边界的有效出现，因此旧地图后来追加的来源帧仍按此规则检查。
 	if len(fd.Sources) != 0 {
-		type occBounds struct {
-			hasFirst    bool
-			firstSeen   int64
-			active      bool
-			invalidTime int64
-		}
-		bounds := make(map[string][]occBounds, len(fd.Landmarks))
+		bounds := make(map[string][]occurrenceWindow, len(fd.Landmarks))
 		for _, lm := range fd.Landmarks {
-			if len(lm.Occurrences) == 0 {
-				// 旧版平铺路标：第 1 次有效出现，首次观测时间未知。
-				bounds[lm.ID] = []occBounds{{active: true}}
-				continue
-			}
-			occs := make([]occBounds, 0, len(lm.Occurrences))
-			for _, oj := range lm.Occurrences {
-				occs = append(occs, occBounds{
-					hasFirst:    oj.HasFirstSeen,
-					firstSeen:   oj.FirstSeenTime,
-					active:      oj.Active,
-					invalidTime: oj.InvalidTime,
-				})
-			}
-			bounds[lm.ID] = occs
+			bounds[lm.ID] = occurrenceWindowsOf(lm)
 		}
 		for k, src := range fd.Sources {
 			if src == nil {
@@ -481,22 +459,11 @@ func validateLoaded(fd *fileData) error {
 			}
 			t := fd.Trajectory[k+1].Time
 			for _, ob := range src.Observations {
-				occs, ok := bounds[ob.ID]
+				wins, ok := bounds[ob.ID]
 				if !ok {
 					return fmt.Errorf("%w: observation of unknown landmark %s at frame time %d", ErrCorrupt, ob.ID, t)
 				}
-				owned := false
-				for _, o := range occs {
-					if o.hasFirst && t < o.firstSeen {
-						continue
-					}
-					if !o.active && t > o.invalidTime {
-						continue
-					}
-					owned = true
-					break
-				}
-				if !owned {
+				if occurrenceNumberAt(wins, t) == 0 {
 					return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, ob.ID, t)
 				}
 			}

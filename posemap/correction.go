@@ -100,27 +100,12 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 
 	// occKey 标识某一路标的某一次出现。回环校正跨越同一路标的多次出现
-	// 时，各次出现分别聚合、分别遵守合并距离限制。
+	// 时，各次出现分别聚合、分别遵守合并距离限制。观测按所在帧时间归入
+	// 当时的那次出现，时间边界规则与打开文件时的归属校验共享（见
+	// occurrence.go）；已接受观测必然属于某次出现。
 	type occKey struct {
 		id  string
 		num int
-	}
-
-	// occAt 把时间 t 的一次观测归入当时的当前出现：各次出现的时间区间
-	// （首次观测时间 .. 失效时间）互不重叠。旧文件的第 1 次出现缺少逐帧
-	// 来源（hasFirstSeen 为假），覆盖最早的全部历史帧。
-	occAt := func(id string, t int64) int {
-		lm := st.landmarks[id]
-		for i, o := range lm.appearances {
-			if o.hasFirstSeen && o.firstSeenTime > t {
-				continue
-			}
-			if !o.active && o.invalidTime < t {
-				continue
-			}
-			return i + 1
-		}
-		return 0 // 不变量：已接受观测必然属于某次出现
 	}
 
 	// 受影响的路标出现：在受影响帧中被观测到的全部（标识，出现编号）。
@@ -128,7 +113,7 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	for j := anchorIdx; j <= end; j++ {
 		t := st.trajectory[j].Time
 		for _, ob := range st.sources[j-1].observations {
-			affected[occKey{id: ob.ID, num: occAt(ob.ID, t)}] = struct{}{}
+			affected[occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceAt(t)}] = struct{}{}
 		}
 	}
 	affectedKeys := make([]occKey, 0, len(affected))
@@ -169,7 +154,7 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		pose := next[j]
 		t := st.trajectory[j].Time
 		for _, ob := range src.observations {
-			k := occKey{id: ob.ID, num: occAt(ob.ID, t)}
+			k := occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceAt(t)}
 			a, ok := aggs[k]
 			if !ok {
 				continue
