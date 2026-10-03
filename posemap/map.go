@@ -287,8 +287,8 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 			if math.Hypot(mx-occ.x, my-occ.y) > m.state.config.MergeDistance {
 				return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
 			}
-			occ.x = (occ.x*float64(occ.count) + mx) / float64(occ.count+1)
-			occ.y = (occ.y*float64(occ.count) + my) / float64(occ.count+1)
+			occ.x = mergeMean(occ.x, occ.count, mx)
+			occ.y = mergeMean(occ.y, occ.count, my)
 			occ.count++
 			touched[ob.ID] = struct{}{}
 		}

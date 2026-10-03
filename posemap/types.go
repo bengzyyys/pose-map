@@ -288,6 +288,16 @@ func normalizeAngle(a float64) float64 {
 // isFinite 判断数值既不是 NaN 也不是 Inf。
 func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 
+// mergeMean 在已有 count 个等权观测的平均值 mean 上并入新的等权观测 v，
+// 返回 count+1 个观测的平均值。采用 mean + (v-mean)/(count+1) 的增量
+// 形式：它与 (mean*count+v)/(count+1) 代数等价，已有观测次数同样参与
+// 权重，但在平均值接近 float64 上限时不会因 mean*count 溢出而错误地
+// 得到 Inf——只要 mean、v 有限且 v 在合并距离之内，增量有限，结果必
+// 有限且落在参与平均的坐标范围内。
+func mergeMean(mean float64, count int, v float64) float64 {
+	return mean + (v-mean)/float64(count+1)
+}
+
 // localToMap 把机器人自身坐标下的点 (lx, ly) 按给定地图坐标位姿
 // 转换到地图坐标：旋转 heading 后平移。
 func localToMap(px, py, heading, lx, ly float64) (float64, float64) {
