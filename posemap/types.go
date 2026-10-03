@@ -161,8 +161,10 @@ type CorrectionRecord struct {
 // 两种情况下 HasLandmark 均为真。校正类原因用 Time 给出提交的锚点
 // 时间且 HasTime 为真；校正中路标冲突时 Time 改为给出冲突观测所在帧的
 // 时间、Landmark 给出路标标识、Occurrence 给出冲突的出现编号（1 起），
-// HasLandmark 与 HasOccurrence 均为真。失效操作中找不到路标或路标当前
-// 已失效时，Landmark 给出路标标识。
+// HasLandmark 与 HasOccurrence 均为真。校正中某条观测转换到地图坐标后
+// 出现非有限数值时同样处理：Time 为该观测所在帧的实际时间、Landmark
+// 与 Occurrence 指出路标标识及其所属的出现编号。失效操作中找不到路标
+// 或路标当前已失效时，Landmark 给出路标标识。
 type RejectError struct {
 	Kind          string
 	Frame         int
@@ -203,6 +205,12 @@ func (e *RejectError) Error() string {
 		return "posemap: frame " + strconv.Itoa(e.Frame) + " has negative motion variance"
 	case RejectNonFinite:
 		if e.HasTime {
+			if e.HasLandmark {
+				if e.HasOccurrence {
+					return "posemap: correction makes observation of landmark " + e.Landmark + " occurrence " + strconv.Itoa(e.Occurrence) + " at frame time " + strconv.FormatInt(e.Time, 10) + " non-finite"
+				}
+				return "posemap: correction makes observation of landmark " + e.Landmark + " at frame time " + strconv.FormatInt(e.Time, 10) + " non-finite"
+			}
 			return "posemap: correction target or corrected result has non-finite value"
 		}
 		if e.HasLandmark {

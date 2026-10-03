@@ -17,7 +17,9 @@ import (
 // 受影响帧中的路标观测随新位姿改变地图位置；更早观测的地图位置不变。
 // 同一路标仍按全部已接受观测、依原时间与同帧输入次序做增量平均并遵守
 // 合并距离限制；观测次数不变。若校正后出现路标冲突，整次校正拒绝并说
-// 明冲突帧时间与路标。输入或校正结果含非有限数值同样拒绝。
+// 明冲突帧时间与路标。输入或校正结果含非有限数值同样拒绝；观测转换到
+// 地图坐标后溢出为 NaN/无穷时按数值异常拒绝，说明该观测所在帧的实际
+// 时间、路标标识与出现编号，而不是误报为距离冲突。
 //
 // 同一标识以相同内容重复提交返回首次结果且不再修改数据；同一标识不同
 // 内容明确拒绝。任何拒绝或保存失败都不改变轨迹、路标与既有校正记录。
@@ -160,6 +162,22 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 				continue
 			}
 			mx, my := localToMap(pose.X, pose.Y, pose.Heading, ob.X, ob.Y)
+			// 目标、原始观测与校正后位姿都有限，转换结果仍可能因数值过大
+			// 溢出为 NaN/无穷。与导入一致：数值异常优先于距离冲突，按
+			// non_finite 拒绝并指出该观测所在帧的实际时间、路标标识与
+			// 其所属的出现编号（不是锚点时间），无论该次出现此前是否已有
+			// 观测、记录仍有效还是已失效。
+			if !isFinite(mx) || !isFinite(my) {
+				return CorrectionRecord{}, &RejectError{
+					Kind:          RejectNonFinite,
+					Time:          st.trajectory[j].Time,
+					HasTime:       true,
+					Landmark:      ob.ID,
+					HasLandmark:   true,
+					Occurrence:    k.num,
+					HasOccurrence: true,
+				}
+			}
 			if a.count > 0 && math.Hypot(mx-a.x, my-a.y) > st.config.MergeDistance {
 				return CorrectionRecord{}, &RejectError{
 					Kind:          RejectLandmarkConflict,
