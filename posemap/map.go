@@ -172,7 +172,11 @@ func validateConfig(cfg Config) error {
 // ImportSegment 导入一批带非空段标识的有序帧。
 //
 // 整段要么全部生效（含落盘），要么因可区分的 *RejectError 被整段拒绝，
-// 此前已提交的位姿、路标、观测次数不受影响。已成功保存的段标识再次以
+// 此前已提交的位姿、路标、观测次数不受影响。输入本身全为有限数值并不保证
+// 推演结果有限：运动完成后的位置、朝向、累计位置方差，或某条观测转换到
+// 地图坐标后的位置若出现 NaN/无穷值，仍以 RejectNonFinite 拒绝产生异常
+// 的帧（从零开始的帧序号；路标坐标异常时携带路标标识），不会留到保存时
+// 才以普通编码错误失败。已成功保存的段标识再次以
 // 相同内容导入时，直接返回首次导入的结果且不改变当前数据；同一标识
 // 对应不同内容则以 RejectDuplicateMismatch 拒绝。
 func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
@@ -251,11 +255,23 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 			Heading:  normalizeAngle(cur.Heading + f.DHeading),
 			Variance: cur.Variance + f.MoveVariance,
 		}
+		// 输入本身有限并不保证结果有限：位置叠加、朝向累计或方差累计
+		// 仍可能溢出为无穷（例如 1e308 再前进 1e308）。按数值异常拒绝
+		// 产生异常的这一帧，而不是等到保存时得到普通编码错误。
+		if !isFinite(cur.X) || !isFinite(cur.Y) || !isFinite(cur.Heading) || !isFinite(cur.Variance) {
+			return reject(RejectNonFinite, i)
+		}
 		newPoses = append(newPoses, cur)
 
 		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序处理。
 		for _, ob := range f.Observations {
 			mx, my := localToMap(cur.X, cur.Y, cur.Heading, ob.X, ob.Y)
+			// 转换结果可能因位姿/观测坐标过大而溢出：无论该路标是首次
+			// 出现、失效后再次出现，还是与有效记录合并，数值异常都优先
+			// 于距离冲突，按同一原因拒绝并携带路标标识。
+			if !isFinite(mx) || !isFinite(my) {
+				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+			}
 			s, seen := staged[ob.ID]
 			if !seen {
 				if lm := st.landmarks[ob.ID]; lm != nil {
