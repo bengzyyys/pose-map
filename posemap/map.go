@@ -225,8 +225,12 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		if f.Time <= prevTime {
 			return reject(RejectTimeOrder, i)
 		}
-		// 相邻位姿间隔上限。
-		if f.Time-prevTime > m.state.config.MaxInterval {
+		// 相邻位姿间隔上限。时间以有符号 int64 毫秒表示且允许负值，
+		// f.Time-prevTime 在 prevTime 接近 math.MinInt64 而 f.Time 为正时
+		// 会溢出回绕成负数，把实际超限的大缺口放过去。此处已保证
+		// f.Time > prevTime，真实差值必落在 [1, 2^64-1]，用无符号减法
+		// 得到精确的数学差值再与上限比较（MaxInterval 已校验为正）。
+		if uint64(f.Time)-uint64(prevTime) > uint64(m.state.config.MaxInterval) {
 			return reject(RejectInterval, i)
 		}
 		// 运动数值有限、方差非负。
