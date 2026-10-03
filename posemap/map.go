@@ -175,6 +175,10 @@ func validateConfig(cfg Config) error {
 // 此前已提交的位姿、路标、观测次数不受影响。已成功保存的段标识再次以
 // 相同内容导入时，直接返回首次导入的结果且不改变当前数据；同一标识
 // 对应不同内容则以 RejectDuplicateMismatch 拒绝。
+//
+// 输入有限但计算结果异常（位置叠加、方差累计或路标坐标转换得到无穷或
+// NaN）同样以 RejectNonFinite 整段拒绝并指出发生异常的帧；路标观测
+// 转换溢出时错误携带该路标标识，且优先于合并距离冲突判定。
 func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -251,11 +255,23 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 			Heading:  normalizeAngle(cur.Heading + f.DHeading),
 			Variance: cur.Variance + f.MoveVariance,
 		}
+		// 输入有限不代表计算结果有限：位置叠加、方差累计或朝向归一
+		// 仍可能溢出为无穷或 NaN。运动完成后的位姿必须保持有限，否则
+		// 按数值异常拒绝本帧（不携带路标标识）。
+		if !isFinite(cur.X) || !isFinite(cur.Y) || !isFinite(cur.Heading) || !isFinite(cur.Variance) {
+			return reject(RejectNonFinite, i)
+		}
 		newPoses = append(newPoses, cur)
 
 		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序处理。
 		for _, ob := range f.Observations {
 			mx, my := localToMap(cur.X, cur.Y, cur.Heading, ob.X, ob.Y)
+			// 转换结果溢出同样按数值异常拒绝并指出路标：必须先于合并
+			// 距离判定，否则无穷坐标会被误报为距离冲突。无论该标识是
+			// 首次出现、失效后再次出现还是正与有效记录合并，均同样处理。
+			if !isFinite(mx) || !isFinite(my) {
+				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+			}
 			s, seen := staged[ob.ID]
 			if !seen {
 				if lm := st.landmarks[ob.ID]; lm != nil {
