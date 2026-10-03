@@ -80,6 +80,24 @@ func (lm *landmarkState) activeOccurrence() *occurrenceState {
 	return last
 }
 
+// occurrenceIndexAt 返回帧时间 t 的一次观测所属出现的下标（出现编号为
+// 下标 + 1）：有首次观测时间的出现只包含不早于该时间的观测，已经失效
+// 的出现只包含不晚于其失效时间的观测，两个端点都包含；缺少首次观测时间
+// 的旧出现起始端不受约束，但失效时间仍然生效。各次出现的时间区间互不
+// 重叠，没有任何出现覆盖 t 时返回 -1。
+func (lm *landmarkState) occurrenceIndexAt(t int64) int {
+	for i, o := range lm.appearances {
+		if o.hasFirstSeen && t < o.firstSeenTime {
+			continue
+		}
+		if !o.active && t > o.invalidTime {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
 // invalidationRecord 记录一次成功失效操作的首次内容与结果，供相同操作
 // 标识以相同原因、相同路标集合重复提交时直接返回。
 type invalidationRecord struct {

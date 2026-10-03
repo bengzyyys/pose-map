@@ -107,20 +107,12 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 
 	// occAt 把时间 t 的一次观测归入当时的当前出现：各次出现的时间区间
-	// （首次观测时间 .. 失效时间）互不重叠。旧文件的第 1 次出现缺少逐帧
-	// 来源（hasFirstSeen 为假），覆盖最早的全部历史帧。
+	// （首次观测时间 .. 失效时间，两端都包含）互不重叠。旧文件的第 1 次
+	// 出现缺少逐帧来源（hasFirstSeen 为假），起始端不约束。
 	occAt := func(id string, t int64) int {
 		lm := st.landmarks[id]
-		for i, o := range lm.appearances {
-			if o.hasFirstSeen && o.firstSeenTime > t {
-				continue
-			}
-			if !o.active && o.invalidTime < t {
-				continue
-			}
-			return i + 1
-		}
-		return 0 // 不变量：已接受观测必然属于某次出现
+		i := lm.occurrenceIndexAt(t)
+		return i + 1 // 无归属时为 0；Open 已保证每条来源都有归属
 	}
 
 	// 受影响的路标出现：在受影响帧中被观测到的全部（标识，出现编号）。

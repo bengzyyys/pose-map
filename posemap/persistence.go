@@ -397,6 +397,7 @@ func validateLoaded(fd *fileData) error {
 		return false
 	}
 	seenIDs := make(map[string]struct{}, len(fd.Landmarks))
+	lmByID := make(map[string]landmarkJSON, len(fd.Landmarks))
 	for _, lm := range fd.Landmarks {
 		if lm.ID == "" {
 			return fmt.Errorf("%w: invalid landmark record", ErrCorrupt)
@@ -405,6 +406,7 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: duplicate landmark %s", ErrCorrupt, lm.ID)
 		}
 		seenIDs[lm.ID] = struct{}{}
+		lmByID[lm.ID] = lm
 		if len(lm.Occurrences) == 0 {
 			// 兼容旧布局：平铺字段表示第 1 次出现。
 			if lm.Count < 1 || !isFinite(lm.X) || !isFinite(lm.Y) {
@@ -440,6 +442,32 @@ func validateLoaded(fd *fileData) error {
 		}
 		if activeCount > 1 {
 			return fmt.Errorf("%w: multiple active occurrences for landmark %s", ErrCorrupt, lm.ID)
+		}
+	}
+	// 逐帧观测来源校验：每条带来源的观测都必须指向存在的路标，且其帧
+	// 时间必须落在该路标某一次出现的区间内（有首次观测时间的出现只含
+	// 不早于该时间的观测，已失效出现只含不晚于失效时间的观测，两端都
+	// 包含）。否则之后的回环校正会把观测归入编号 0 而越界崩溃，因此在
+	// 打开时即按损坏拒绝，不等到某次校正恰好覆盖该帧。失效历史中的旧
+	// 观测只要不晚于当年那次出现的失效时间就仍然有效，不能只查当前有效
+	// 路标。旧文件整列缺省 sources（长度为 0），其中无来源的历史部分
+	// 不要求补齐依据，保持兼容；旧文件后来追加的、确实带来源的帧仍需
+	// 检查归属。
+	if len(fd.Sources) != 0 {
+		for k, src := range fd.Sources {
+			if src == nil {
+				continue // 旧文件帧：无逐帧依据，无从检查
+			}
+			frameTime := fd.Trajectory[k+1].Time
+			for _, ob := range src.Observations {
+				lm, ok := lmByID[ob.ID]
+				if !ok {
+					return fmt.Errorf("%w: observation of unknown landmark %s at frame time %d", ErrCorrupt, ob.ID, frameTime)
+				}
+				if occurrenceContainsFrame(lm, frameTime) < 0 {
+					return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, ob.ID, frameTime)
+				}
+			}
 		}
 	}
 	segIDs := make(map[string]struct{}, len(fd.Segments))
@@ -505,6 +533,30 @@ func validateLoaded(fd *fileData) error {
 
 func finitePose(p Pose) bool {
 	return isFinite(p.X) && isFinite(p.Y) && isFinite(p.Heading) && isFinite(p.Variance)
+}
+
+// occurrenceContainsFrame 返回覆盖帧时间 t 的出现下标（出现编号为下标
+// +1），没有任何出现覆盖 t 时返回 -1。判定与运行时的
+// landmarkState.occurrenceIndexAt 一致：有首次观测时间的出现只含不早于
+// 该时间的帧，已失效出现只含不晚于失效时间的帧，两个端点都包含；缺少
+// 首次观测时间的旧出现起始端不约束。
+func occurrenceContainsFrame(lm landmarkJSON, t int64) int {
+	if len(lm.Occurrences) == 0 {
+		// 兼容旧平铺布局：该出现加载时恒为有效，且要么是无来源旧帧
+		// （nil 来源已跳过），要么首次观测时间取最早来源帧，任一来源
+		// 帧都不早于它，因此始终包含。
+		return 0
+	}
+	for i, oj := range lm.Occurrences {
+		if oj.HasFirstSeen && t < oj.FirstSeenTime {
+			continue
+		}
+		if !oj.Active && t > oj.InvalidTime {
+			continue
+		}
+		return i
+	}
+	return -1
 }
 
 // canonicalCorrectionHash 计算一次校正请求（锚点时间 + 目标位姿）的
