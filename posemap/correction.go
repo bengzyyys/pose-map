@@ -106,29 +106,17 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		num int
 	}
 
-	// occAt 把时间 t 的一次观测归入当时的当前出现：各次出现的时间区间
-	// （首次观测时间 .. 失效时间）互不重叠。旧文件的第 1 次出现缺少逐帧
-	// 来源（hasFirstSeen 为假），覆盖最早的全部历史帧。
-	occAt := func(id string, t int64) int {
-		lm := st.landmarks[id]
-		for i, o := range lm.appearances {
-			if o.hasFirstSeen && o.firstSeenTime > t {
-				continue
-			}
-			if !o.active && o.invalidTime < t {
-				continue
-			}
-			return i + 1
-		}
-		return 0 // 不变量：已接受观测必然属于某次出现
-	}
+	// 观测按其所在帧时间归入“当时”的那次出现（归属规则见 occurrence.go，
+	// 与打开文件时的归属校验共用同一处实现）：各次出现的时间区间互不
+	// 重叠，回环跨越多次出现时分别聚合。旧文件第 1 次出现缺少逐帧来源
+	// （hasFirstSeen 为假），覆盖最早的全部历史帧。
 
 	// 受影响的路标出现：在受影响帧中被观测到的全部（标识，出现编号）。
 	affected := make(map[occKey]struct{})
 	for j := anchorIdx; j <= end; j++ {
 		t := st.trajectory[j].Time
 		for _, ob := range st.sources[j-1].observations {
-			affected[occKey{id: ob.ID, num: occAt(ob.ID, t)}] = struct{}{}
+			affected[occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceNumberAt(t)}] = struct{}{}
 		}
 	}
 	affectedKeys := make([]occKey, 0, len(affected))
@@ -169,7 +157,9 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		pose := next[j]
 		t := st.trajectory[j].Time
 		for _, ob := range src.observations {
-			k := occKey{id: ob.ID, num: occAt(ob.ID, t)}
+			// 已接受观测必然属于某次出现（打开文件时已校验归属），归并
+			// 规则与受影响集合的圈选一致。
+			k := occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceNumberAt(t)}
 			a, ok := aggs[k]
 			if !ok {
 				continue
