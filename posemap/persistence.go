@@ -670,6 +670,11 @@ func validateLoaded(fd *fileData) error {
 		corrIDs[cr.ID] = struct{}{}
 	}
 	invalIDs := make(map[string]struct{}, len(fd.Invalidations))
+	// 失效记录与路标历史的对应核对按标识索引路标：标识已在前面校验唯一。
+	lmByID := make(map[string]*landmarkJSON, len(fd.Landmarks))
+	for i := range fd.Landmarks {
+		lmByID[fd.Landmarks[i].ID] = &fd.Landmarks[i]
+	}
 	for _, iv := range fd.Invalidations {
 		if iv.ID == "" || iv.Reason == "" || iv.Hash == "" || len(iv.Landmarks) == 0 {
 			return fmt.Errorf("%w: invalid invalidation record", ErrCorrupt)
@@ -687,6 +692,29 @@ func validateLoaded(fd *fileData) error {
 				return fmt.Errorf("%w: invalidation %s lists %s twice", ErrCorrupt, iv.ID, l.ID)
 			}
 			lmSeen[l.ID] = struct{}{}
+			// 保存的失效结果必须与路标历史准确对应：按保存的编号找到该
+			// 路标的该次出现，它必须确实被这条操作撤下——已失效，且保存
+			// 的失效操作标识、失效时间、失效原因都与本记录一致。编号指向
+			// 不存在的出现、指向仍有效的出现（如路标后来再次出现的最新
+			// 记录），或该次出现实际由另一条操作撤下（哪怕时间与原因恰
+			// 好相同），都说明保存的结果与历史矛盾；不能用同一路标的其
+			// 他出现顶替，也不能删改条目继续加载，整份文件按损坏拒绝。
+			// 旧版平铺路标没有 occurrences，视为仍有效的第 1 次出现，
+			// 任何指向它的失效记录同样对不上。
+			lm, ok := lmByID[l.ID]
+			if !ok {
+				return fmt.Errorf("%w: invalidation %s refers to unknown landmark %s", ErrCorrupt, iv.ID, l.ID)
+			}
+			if l.Occurrence > len(lm.Occurrences) {
+				return fmt.Errorf("%w: invalidation %s refers to landmark %s occurrence %d which does not exist", ErrCorrupt, iv.ID, l.ID, l.Occurrence)
+			}
+			oj := lm.Occurrences[l.Occurrence-1]
+			if oj.Active {
+				return fmt.Errorf("%w: invalidation %s refers to landmark %s occurrence %d which is still active", ErrCorrupt, iv.ID, l.ID, l.Occurrence)
+			}
+			if oj.InvalidOpID != iv.ID || oj.InvalidTime != iv.Time || oj.InvalidReason != iv.Reason {
+				return fmt.Errorf("%w: invalidation %s does not match invalidation info of landmark %s occurrence %d", ErrCorrupt, iv.ID, l.ID, l.Occurrence)
+			}
 		}
 	}
 	return nil
