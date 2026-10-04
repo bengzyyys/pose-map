@@ -131,28 +131,28 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 
 	// 逐“出现”运行聚合：旧文件第 1 次出现的既有观测作为固定“旧贡献”
 	// 起点（位置不随校正改变），其余观测按帧时间与同帧输入次序、以当前/
-	// 校正后位姿重放，完整复刻导入时的增量平均与合并距离判定。同一路标的
-	// 不同出现互不参与彼此的合并。
-	type agg struct {
-		count int
-		x, y  float64
-	}
-	aggs := make(map[occKey]*agg, len(affectedKeys))
+	// 校正后位姿重放。接纳与合并规则（含合并距离判定、数值异常优先、端点
+	// 包含、等权增量平均）与导入共享同一个 obsAccumulator（见
+	// observation.go），同一路标的不同出现各自持有独立聚合，互不参与彼此
+	// 的合并。
+	aggs := make(map[occKey]obsAccumulator, len(affectedKeys))
 	for _, k := range affectedKeys {
 		occ := st.landmarks[k.id].appearances[k.num-1]
-		a := &agg{}
 		if occ.legacyCount > 0 {
-			a.count = occ.legacyCount
-			a.x = occ.legacyMX
-			a.y = occ.legacyMY
+			// 旧文件第 1 次出现：固定历史贡献作为重放起点。
+			aggs[k] = seedObsAccumulator(occ.legacyMX, occ.legacyMY, occ.legacyCount)
+		} else {
+			// 依据完整的出现：从空开始重放其全部观测，首条观测直接定位。
+			aggs[k] = obsAccumulator{}
 		}
-		aggs[k] = a
 	}
 	for j := 1; j <= end; j++ {
 		src := st.sources[j-1]
 		if src == nil {
 			continue // 旧文件帧：观测已计入对应出现的 legacy 起点
 		}
+		// j < anchorIdx 的帧不在受影响范围，next[j] 仍是原位姿：这些更早
+		// 的观测以原地图位置重放，构成固定均值；受影响帧才用校正后位姿。
 		pose := next[j]
 		t := st.trajectory[j].Time
 		for _, ob := range src.observations {
@@ -161,13 +161,11 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 			if !ok {
 				continue
 			}
-			mx, my := localToMap(pose.X, pose.Y, pose.Heading, ob.X, ob.Y)
-			// 目标、原始观测与校正后位姿都有限，转换结果仍可能因数值过大
-			// 溢出为 NaN/无穷。与导入一致：数值异常优先于距离冲突，按
-			// non_finite 拒绝并指出该观测所在帧的实际时间、路标标识与
-			// 其所属的出现编号（不是锚点时间），无论该次出现此前是否已有
-			// 观测、记录仍有效还是已失效。
-			if !isFinite(mx) || !isFinite(my) {
+			// 拒绝时指出该观测所在帧的实际时间、路标标识与其所属的出现编号
+			// （不是锚点时间），无论该次出现此前是否已有观测、记录仍有效还是
+			// 已失效。
+			switch a.accept(pose, ob, st.config.MergeDistance) {
+			case acceptNonFinite:
 				return CorrectionRecord{}, &RejectError{
 					Kind:          RejectNonFinite,
 					Time:          st.trajectory[j].Time,
@@ -177,8 +175,7 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 					Occurrence:    k.num,
 					HasOccurrence: true,
 				}
-			}
-			if a.count > 0 && math.Hypot(mx-a.x, my-a.y) > st.config.MergeDistance {
+			case acceptConflict:
 				return CorrectionRecord{}, &RejectError{
 					Kind:          RejectLandmarkConflict,
 					Time:          st.trajectory[j].Time,
@@ -189,9 +186,7 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 					HasOccurrence: true,
 				}
 			}
-			a.x = mergeMean(a.x, mx, a.count)
-			a.y = mergeMean(a.y, my, a.count)
-			a.count++
+			aggs[k] = a
 		}
 	}
 	for _, k := range affectedKeys {

@@ -3,7 +3,6 @@ package posemap
 import (
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"sync"
 )
@@ -208,9 +207,12 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	prevTime := cur.Time
 	newPoses := make([]Pose, 0, len(seg.Frames))
 	// staged 记录本帧触及路标的暂存“当前出现”副本：created 为真表示这是
-	// 本段内首次新观测产生的新出现（此前不存在当前有效记录）。
+	// 本段内首次新观测产生的新出现（此前不存在当前有效记录）。接纳与合并
+	// 判定全部在 acc 上按统一规则进行（见 observation.go），提交时再把聚合
+	// 结果写回 occ。
 	type stagedLM struct {
 		occ     *occurrenceState
+		acc     obsAccumulator
 		created bool
 	}
 	staged := make(map[string]stagedLM) // 本段触及路标的暂存聚合
@@ -269,47 +271,45 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 
 		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序处理。
 		for _, ob := range f.Observations {
-			mx, my := localToMap(cur.X, cur.Y, cur.Heading, ob.X, ob.Y)
-			// 转换结果可能因位姿/观测坐标过大而溢出：无论该路标是首次
-			// 出现、失效后再次出现，还是与有效记录合并，数值异常都优先
-			// 于距离冲突，按同一原因拒绝并携带路标标识。
-			if !isFinite(mx) || !isFinite(my) {
-				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
-			}
 			s, seen := staged[ob.ID]
 			if !seen {
 				if lm := st.landmarks[ob.ID]; lm != nil {
 					if active := lm.activeOccurrence(); active != nil {
 						// 复制当前有效出现，避免提前修改真实状态。旧出现
-						// （已失效）永不参与新观测的合并。
+						// （已失效）永不参与新观测的合并；新观测从该有效
+						// 记录当时的平均位置与计数继续接纳。
 						cp := *active
-						s = stagedLM{occ: &cp, created: false}
+						s = stagedLM{
+							occ:     &cp,
+							acc:     seedObsAccumulator(cp.x, cp.y, cp.count),
+							created: false,
+						}
 					}
 				}
 				if s.occ == nil {
-					// 从未出现或最近一次已失效：本次为新的一次出现，
-					// 编号在提交时确定，观测计数从 1 开始。
-					s = stagedLM{
-						occ: &occurrenceState{
-							x: mx, y: my, count: 1,
-							firstSeenTime: f.Time, hasFirstSeen: true,
-							active: true,
-						},
-						created: true,
-					}
-					staged[ob.ID] = s
-					touched[ob.ID] = struct{}{}
-					continue
+					// 从未出现或最近一次已失效：本次为新的一次出现，编号在
+					// 提交时确定。聚合从空开始，首条观测直接定位、计数从 1
+					// 开始；身份字段（首次观测时间等）在提交时补到 occ。
+					s = stagedLM{occ: &occurrenceState{}, created: true}
 				}
 				staged[ob.ID] = s
 			}
-			occ := s.occ
-			if math.Hypot(mx-occ.x, my-occ.y) > m.state.config.MergeDistance {
+			// 接纳与合并规则与回环校正重放共享（observation.go）：数值异常
+			// 优先于距离冲突，端点恰好等于合并上限仍接纳，同帧逐条影响后续。
+			switch s.acc.accept(cur, ob, st.config.MergeDistance) {
+			case acceptNonFinite:
+				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+			case acceptConflict:
 				return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
 			}
-			occ.x = mergeMean(occ.x, mx, occ.count)
-			occ.y = mergeMean(occ.y, my, occ.count)
-			occ.count++
+			// 就地更新暂存副本并回写 map（首次创建与既有合并统一处理）。
+			s.occ.x, s.occ.y, s.occ.count = s.acc.x, s.acc.y, s.acc.count
+			if s.created && s.occ.count == 1 {
+				s.occ.firstSeenTime = f.Time
+				s.occ.hasFirstSeen = true
+				s.occ.active = true
+			}
+			staged[ob.ID] = s
 			touched[ob.ID] = struct{}{}
 		}
 
