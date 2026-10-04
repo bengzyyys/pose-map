@@ -665,6 +665,54 @@ func validateLoaded(fd *fileData) error {
 				return fmt.Errorf("%w: correction %s has non-finite pose", ErrCorrupt, cr.ID)
 			}
 		}
+		// 以下两项核对都只针对范围内逐帧依据完整的校正：范围内任一来源
+		// 帧为 null 旧帧时保留旧文件的既有打开规则，不推测运动方差、也
+		// 不把未知贡献当成零；纯旧文件缺省 sources（长度为 0，bounds 同
+		// 时为 nil）时所有记录都不核对。同一文件中其余依据完整的记录不
+		// 受含旧帧记录影响，仍逐一核对。
+		fullyBased := len(fd.Sources) != 0
+		if fullyBased {
+			for k := anchorIdx - 1; k <= endIdx-1; k++ {
+				if fd.Sources[k] == nil {
+					fullyBased = false
+					break
+				}
+			}
+		}
+		if fullyBased {
+			// 校正后方差核对：锚点帧的校正后方差必须等于该次提交的目标
+			// 方差；其后每帧在目标方差上，按时间顺序累加锚点之后至该帧
+			// 的原运动方差。锚点自身进入该帧的运动方差不再加一次，也不
+			// 能以校正前方差作为起点；累计范围以本记录自己的锚点与结束
+			// 时间为准，后来对重叠范围的再校正与之后追加的帧都不属于本
+			// 记录。目标方差或参与累计的运动方差为负/非有限、累计结果非
+			// 有限，或与保存的校正后方差不完全一致，都按损坏拒绝整份文
+			// 件——每一帧逐一核对，不能只凭锚点与末帧正确就接受中间错误
+			// 的记录；目标方差与运动方差全为零的合法校正同样逐帧通过。
+			accum := cr.Target.Variance
+			if !isFinite(accum) || accum < 0 {
+				return fmt.Errorf("%w: correction %s target variance is negative or non-finite", ErrCorrupt, cr.ID)
+			}
+			for i, pc := range cr.Poses {
+				if i > 0 {
+					// 记录内第 i 帧位于轨迹下标 anchorIdx+i；进入它的运
+					// 动方差在来源 sources[anchorIdx+i-1]（i=1 即锚点之
+					// 后第一帧），锚点自身的来源 sources[anchorIdx-1] 不
+					// 参与累计。
+					mv := fd.Sources[anchorIdx+i-1].MoveVariance
+					if !isFinite(mv) || mv < 0 {
+						return fmt.Errorf("%w: correction %s accumulates negative or non-finite motion variance at frame time %d", ErrCorrupt, cr.ID, pc.After.Time)
+					}
+					accum += mv
+					if !isFinite(accum) {
+						return fmt.Errorf("%w: correction %s corrected variance accumulates to non-finite value at frame time %d", ErrCorrupt, cr.ID, pc.After.Time)
+					}
+				}
+				if pc.After.Variance != accum {
+					return fmt.Errorf("%w: correction %s pose at frame time %d has corrected variance %v but target variance %v and the motion variances after the anchor accumulate to %v", ErrCorrupt, cr.ID, pc.After.Time, pc.After.Variance, cr.Target.Variance, accum)
+				}
+			}
+		}
 		for _, lc := range cr.Landmarks {
 			if lc.ID == "" {
 				return fmt.Errorf("%w: correction %s has empty landmark id", ErrCorrupt, cr.ID)
@@ -688,49 +736,40 @@ func validateLoaded(fd *fileData) error {
 		// 为空，非空即损坏。仅对范围内逐帧依据完整的校正做此核对：范围内
 		// 含 null 旧帧的校正缺少逐帧依据，保留旧地图的既有打开规则，不凭
 		// 推测要求补造观测。
-		if bounds != nil {
-			fullyBased := true
-			for k := anchorIdx - 1; k <= endIdx-1; k++ {
-				if fd.Sources[k] == nil {
-					fullyBased = false
-					break
+		if bounds != nil && fullyBased {
+			want := make(map[corrOccKey]struct{})
+			for j := anchorIdx; j <= endIdx; j++ {
+				t := fd.Trajectory[j].Time
+				for _, ob := range fd.Sources[j-1].Observations {
+					// 归属已在上方的来源校验中确认（路标存在、必有唯一
+					// 接纳出现），这里同样计算以保持两处规则一致。
+					want[corrOccKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
 				}
 			}
-			if fullyBased {
-				want := make(map[corrOccKey]struct{})
-				for j := anchorIdx; j <= endIdx; j++ {
-					t := fd.Trajectory[j].Time
-					for _, ob := range fd.Sources[j-1].Observations {
-						// 归属已在上方的来源校验中确认（路标存在、必有唯一
-						// 接纳出现），这里同样计算以保持两处规则一致。
-						want[corrOccKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
-					}
+			got := make(map[corrOccKey]struct{}, len(cr.Landmarks))
+			for _, lc := range cr.Landmarks {
+				num := lc.Occurrence
+				if num == 0 {
+					num = 1 // 更早版本写出的校正记录不带编号，按第 1 次出现解释
 				}
-				got := make(map[corrOccKey]struct{}, len(cr.Landmarks))
-				for _, lc := range cr.Landmarks {
-					num := lc.Occurrence
-					if num == 0 {
-						num = 1 // 更早版本写出的校正记录不带编号，按第 1 次出现解释
-					}
-					wins, ok := bounds[lc.ID]
-					if !ok || num < 1 || num > len(wins) {
-						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d not touched by its range", ErrCorrupt, cr.ID, lc.ID, num)
-					}
-					key := corrOccKey{id: lc.ID, num: num}
-					if _, dup := got[key]; dup {
-						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
-					}
-					got[key] = struct{}{}
+				wins, ok := bounds[lc.ID]
+				if !ok || num < 1 || num > len(wins) {
+					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d not touched by its range", ErrCorrupt, cr.ID, lc.ID, num)
 				}
-				for key := range want {
-					if _, ok := got[key]; !ok {
-						return fmt.Errorf("%w: correction %s misses landmark %s occurrence %d observed in its range", ErrCorrupt, cr.ID, key.id, key.num)
-					}
+				key := corrOccKey{id: lc.ID, num: num}
+				if _, dup := got[key]; dup {
+					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
 				}
-				for key := range got {
-					if _, ok := want[key]; !ok {
-						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d with no observation in its range", ErrCorrupt, cr.ID, key.id, key.num)
-					}
+				got[key] = struct{}{}
+			}
+			for key := range want {
+				if _, ok := got[key]; !ok {
+					return fmt.Errorf("%w: correction %s misses landmark %s occurrence %d observed in its range", ErrCorrupt, cr.ID, key.id, key.num)
+				}
+			}
+			for key := range got {
+				if _, ok := want[key]; !ok {
+					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d with no observation in its range", ErrCorrupt, cr.ID, key.id, key.num)
 				}
 			}
 		}
