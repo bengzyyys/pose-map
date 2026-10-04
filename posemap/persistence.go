@@ -489,8 +489,22 @@ func validateLoaded(fd *fileData) error {
 	// 一次无边界的有效出现，因此旧地图后来追加的来源帧仍按此规则检查。
 	if len(fd.Sources) != 0 {
 		bounds := make(map[string][]occurrenceWindow, len(fd.Landmarks))
+		// counts[id][i] 先放该路标第 i+1 次出现中已保存的固定旧贡献次数，
+		// 再在下面逐条累加归属该次出现的来源观测条数。最终必须与记录的
+		// Count 完全相等（偏多偏少都按损坏拒绝）。
+		counts := make(map[string][]int, len(fd.Landmarks))
 		for _, lm := range fd.Landmarks {
 			bounds[lm.ID] = occurrenceWindowsOf(lm)
+			if len(lm.Occurrences) > 0 {
+				c := make([]int, len(lm.Occurrences))
+				for i, oj := range lm.Occurrences {
+					c[i] = oj.LegacyCount
+				}
+				counts[lm.ID] = c
+			} else {
+				// 旧版平铺路标：一次出现，固定旧贡献次数在平铺字段里。
+				counts[lm.ID] = []int{lm.LegacyCount}
+			}
 		}
 		for k, src := range fd.Sources {
 			if src == nil {
@@ -502,9 +516,27 @@ func validateLoaded(fd *fileData) error {
 				if !ok {
 					return fmt.Errorf("%w: observation of unknown landmark %s at frame time %d", ErrCorrupt, ob.ID, t)
 				}
-				if occurrenceNumberAt(wins, t) == 0 {
+				n := occurrenceNumberAt(wins, t)
+				if n == 0 {
 					return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, ob.ID, t)
 				}
+				// 每条观测各算一次；同一帧重复观测同一标识也各加一次，
+				// 不去重；没有观测的帧自然不增加任何计数。
+				counts[ob.ID][n-1]++
+			}
+		}
+		// 次数核对逐出现进行：失效的旧出现也要核对（不能跳过），各次出现
+		// 独立结算（旧出现的观测不能拿来补足新出现，反之亦然）。即使其他
+		// 路标完全正确，任一记录矛盾都整份拒绝。
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) > 0 {
+				for i, oj := range lm.Occurrences {
+					if got := counts[lm.ID][i]; oj.Count != got {
+						return fmt.Errorf("%w: occurrence %d of landmark %s records %d observations, sources plus legacy contributions contain %d", ErrCorrupt, oj.Number, lm.ID, oj.Count, got)
+					}
+				}
+			} else if got := counts[lm.ID][0]; lm.Count != got {
+				return fmt.Errorf("%w: landmark %s records %d observations, sources plus legacy contributions contain %d", ErrCorrupt, lm.ID, lm.Count, got)
 			}
 		}
 	}
