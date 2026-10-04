@@ -479,8 +479,11 @@ func validateLoaded(fd *fileData) error {
 	// 300 再现时的 250 帧）的观测没有归属，按损坏拒绝。null 帧来自缺少
 	// 逐帧依据的旧地图，其观测不在这里（也无法）核验；旧版平铺路标视为
 	// 一次无边界的有效出现，因此旧地图后来追加的来源帧仍按此规则检查。
+	// 路标各次出现的时间边界，供观测归属与校正记录路标列表核对使用；
+	// 仅在有逐帧依据时构建。
+	var bounds map[string][]occurrenceWindow
 	if len(fd.Sources) != 0 {
-		bounds := make(map[string][]occurrenceWindow, len(fd.Landmarks))
+		bounds = make(map[string][]occurrenceWindow, len(fd.Landmarks))
 		for _, lm := range fd.Landmarks {
 			bounds[lm.ID] = occurrenceWindowsOf(lm)
 		}
@@ -662,6 +665,63 @@ func validateLoaded(fd *fileData) error {
 				!isFinite(lc.After.X) || !isFinite(lc.After.Y) ||
 				lc.Before.Count < 1 || lc.After.Count < 1 {
 				return fmt.Errorf("%w: correction %s has invalid landmark change", ErrCorrupt, cr.ID)
+			}
+		}
+		// 路标列表核对：覆盖帧（锚点帧到结束帧，两端都包含）全部带有逐帧
+		// 依据的校正，其路标列表必须准确描述该范围内观测所涉及的路标出现
+		// ——范围内被观测到的每个（标识，出现编号）恰好有一条记录，不多、
+		// 不少、不重复，也不能把编号改成该范围没有涉及的另一编号。观测按
+		// 所在帧时间归入当时的出现（与归属校验、校正重放共享同一时间边界
+		// 规则）：同一次出现被多帧或同帧多条观测涉及仍只应有一条记录；已
+		// 失效的旧出现在其时间边界内被观测到时同样必须列出，不因区域查询
+		// 不再返回它而豁免；失效时刻的观测仍属旧出现，下一次出现的首次
+		// 观测属新出现。范围内没有路标观测时空列表合法，任何非空条目都是
+		// 多记。条目里的前后位置与次数是提交时的历史快照，只核对（标识，
+		// 出现编号）集合，不与当前值比较；没有改变位置的出现在范围内有
+		// 观测时同样必须保留记录。缺编号的旧条目按第 1 次出现解释。覆盖
+		// 帧含缺少逐帧依据的旧帧时无法重建涉及集合，保留既有基本校验，
+		// 不要求补造观测。
+		if len(fd.Sources) != 0 {
+			fullBasis := true
+			for k := anchorIdx - 1; k <= endIdx-1; k++ {
+				if fd.Sources[k] == nil {
+					fullBasis = false
+					break
+				}
+			}
+			if fullBasis {
+				type corrLMKey struct {
+					id  string
+					num int
+				}
+				affected := make(map[corrLMKey]struct{})
+				for j := anchorIdx; j <= endIdx; j++ {
+					t := fd.Trajectory[j].Time
+					for _, ob := range fd.Sources[j-1].Observations {
+						// 归属（存在性与时间边界）已在前面校验，编号必非 0。
+						affected[corrLMKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
+					}
+				}
+				listed := make(map[corrLMKey]struct{}, len(cr.Landmarks))
+				for _, lc := range cr.Landmarks {
+					num := lc.Occurrence
+					if num == 0 {
+						num = 1 // 更早版本写出的校正记录不带编号，只有第 1 次出现
+					}
+					key := corrLMKey{id: lc.ID, num: num}
+					if _, ok := affected[key]; !ok {
+						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d which is not observed in its range", ErrCorrupt, cr.ID, lc.ID, num)
+					}
+					if _, dup := listed[key]; dup {
+						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
+					}
+					listed[key] = struct{}{}
+				}
+				for key := range affected {
+					if _, ok := listed[key]; !ok {
+						return fmt.Errorf("%w: correction %s omits landmark %s occurrence %d observed in its range", ErrCorrupt, cr.ID, key.id, key.num)
+					}
+				}
 			}
 		}
 		if _, dup := corrIDs[cr.ID]; dup {
