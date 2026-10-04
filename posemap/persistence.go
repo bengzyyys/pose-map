@@ -492,6 +492,11 @@ func validateLoaded(fd *fileData) error {
 		for _, lm := range fd.Landmarks {
 			bounds[lm.ID] = occurrenceWindowsOf(lm)
 		}
+		// 归属校验的同时按（路标，出现编号）统计来源观测条数：每条观测
+		// 各算一次，同帧重复观测同一标识不去重，空观测帧不计。null 帧
+		// 缺少逐帧依据，其贡献已固定在出现的旧观测计数中，不在此统计，
+		// 也不能按帧数猜测。
+		tallies := make(map[string]map[int]int, len(fd.Landmarks))
 		for k, src := range fd.Sources {
 			if src == nil {
 				continue // 旧地图帧：无逐帧依据，不要求补齐归属
@@ -502,8 +507,34 @@ func validateLoaded(fd *fileData) error {
 				if !ok {
 					return fmt.Errorf("%w: observation of unknown landmark %s at frame time %d", ErrCorrupt, ob.ID, t)
 				}
-				if occurrenceNumberAt(wins, t) == 0 {
+				num := occurrenceNumberAt(wins, t)
+				if num == 0 {
 					return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, ob.ID, t)
+				}
+				c := tallies[ob.ID]
+				if c == nil {
+					c = make(map[int]int, 1)
+					tallies[ob.ID] = c
+				}
+				c[num]++
+			}
+		}
+		// 每次出现记录的观测次数必须等于归属该次出现的来源观测条数加上
+		// 该次出现已保存的旧观测贡献：偏多或偏少都是文件损坏。各次出现
+		// 分别核对，不能用另一次出现的观测补足；已失效的旧出现同样核对，
+		// 不因它不再参与区域查询而跳过。回环校正只改位置不改已接受观测
+		// 次数，正常校正后保存的文件仍满足此不变量。
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) == 0 {
+				// 旧版平铺路标即第 1 次出现。
+				if got := tallies[lm.ID][1] + lm.LegacyCount; got != lm.Count {
+					return fmt.Errorf("%w: landmark %s records %d observations but sources and legacy contributions account for %d", ErrCorrupt, lm.ID, lm.Count, got)
+				}
+				continue
+			}
+			for _, oj := range lm.Occurrences {
+				if got := tallies[lm.ID][oj.Number] + oj.LegacyCount; got != oj.Count {
+					return fmt.Errorf("%w: landmark %s occurrence %d records %d observations but sources and legacy contributions account for %d", ErrCorrupt, lm.ID, oj.Number, oj.Count, got)
 				}
 			}
 		}
