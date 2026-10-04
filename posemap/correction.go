@@ -77,6 +77,13 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	// 相对位姿整体旋转 δ；平移锚点到目标位置。
 	dHeading := normalizeAngle(newHeading - oldAnchor.Heading)
 	cosD, sinD := math.Cos(dHeading), math.Sin(dHeading)
+	// 目标位置与朝向与锚点当前值一致（朝向按角度等价比较：δ 归一后为 0）
+	// 时是只改方差的恒等校正：几何上没有任何平移或旋转，校正前后位姿必须
+	// 完全相同。此时仍套用旋转平移公式会先求 old-oldAnchor 的相对偏移，当
+	// 轨迹横跨 ±1e308 这类大坐标时该差值先溢出为 ±Inf、再参与浮点运算退化
+	// 为 NaN，使本应成功的校正被误判为 non_finite。恒等校正直接保留原位姿，
+	// 只按累计规则更新方差。
+	identity := dHeading == 0 && tgt.X == oldAnchor.X && tgt.Y == oldAnchor.Y
 
 	// ---- 在副本上推演新位姿，真实状态此时保持不变 ----
 	next := append([]Pose(nil), st.trajectory...)
@@ -86,14 +93,25 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		if j > anchorIdx {
 			accumVar += st.sources[j-1].moveVariance
 		}
-		dx := old.X - oldAnchor.X
-		dy := old.Y - oldAnchor.Y
-		np := Pose{
-			Time:     old.Time,
-			X:        tgt.X + cosD*dx - sinD*dy,
-			Y:        tgt.Y + sinD*dx + cosD*dy,
-			Heading:  normalizeAngle(old.Heading + dHeading),
-			Variance: accumVar,
+		var np Pose
+		if identity {
+			np = Pose{
+				Time:     old.Time,
+				X:        old.X,
+				Y:        old.Y,
+				Heading:  old.Heading,
+				Variance: accumVar,
+			}
+		} else {
+			dx := old.X - oldAnchor.X
+			dy := old.Y - oldAnchor.Y
+			np = Pose{
+				Time:     old.Time,
+				X:        tgt.X + cosD*dx - sinD*dy,
+				Y:        tgt.Y + sinD*dx + cosD*dy,
+				Heading:  normalizeAngle(old.Heading + dHeading),
+				Variance: accumVar,
+			}
 		}
 		if !isFinite(np.X) || !isFinite(np.Y) || !isFinite(np.Heading) || !isFinite(np.Variance) {
 			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
