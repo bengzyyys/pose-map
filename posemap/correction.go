@@ -131,20 +131,16 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 
 	// 逐“出现”运行聚合：旧文件第 1 次出现的既有观测作为固定“旧贡献”
 	// 起点（位置不随校正改变），其余观测按帧时间与同帧输入次序、以当前/
-	// 校正后位姿重放，完整复刻导入时的增量平均与合并距离判定。同一路标的
-	// 不同出现互不参与彼此的合并。
-	type agg struct {
-		count int
-		x, y  float64
-	}
-	aggs := make(map[occKey]*agg, len(affectedKeys))
+	// 校正后位姿重放，接纳与合并规则（转换、非有限优先、首条建点、距离
+	// 判定、增量平均、计数）与导入共享同一实现（见 aggregate.go）。同一路
+	// 标的不同出现互不参与彼此的合并。
+	aggs := make(map[occKey]*observationAgg, len(affectedKeys))
 	for _, k := range affectedKeys {
 		occ := st.landmarks[k.id].appearances[k.num-1]
-		a := &agg{}
+		a := &observationAgg{}
 		if occ.legacyCount > 0 {
-			a.count = occ.legacyCount
-			a.x = occ.legacyMX
-			a.y = occ.legacyMY
+			// 旧文件第 1 次出现：固定旧贡献作为聚合起点，不随后续校正改变。
+			a.seed(occ.legacyCount, occ.legacyMX, occ.legacyMY)
 		}
 		aggs[k] = a
 	}
@@ -161,13 +157,13 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 			if !ok {
 				continue
 			}
-			mx, my := localToMap(pose.X, pose.Y, pose.Heading, ob.X, ob.Y)
 			// 目标、原始观测与校正后位姿都有限，转换结果仍可能因数值过大
 			// 溢出为 NaN/无穷。与导入一致：数值异常优先于距离冲突，按
 			// non_finite 拒绝并指出该观测所在帧的实际时间、路标标识与
 			// 其所属的出现编号（不是锚点时间），无论该次出现此前是否已有
 			// 观测、记录仍有效还是已失效。
-			if !isFinite(mx) || !isFinite(my) {
+			switch a.admit(pose, ob, st.config.MergeDistance) {
+			case obsNonFinite:
 				return CorrectionRecord{}, &RejectError{
 					Kind:          RejectNonFinite,
 					Time:          st.trajectory[j].Time,
@@ -177,8 +173,7 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 					Occurrence:    k.num,
 					HasOccurrence: true,
 				}
-			}
-			if a.count > 0 && math.Hypot(mx-a.x, my-a.y) > st.config.MergeDistance {
+			case obsConflict:
 				return CorrectionRecord{}, &RejectError{
 					Kind:          RejectLandmarkConflict,
 					Time:          st.trajectory[j].Time,
@@ -189,9 +184,6 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 					HasOccurrence: true,
 				}
 			}
-			a.x = mergeMean(a.x, mx, a.count)
-			a.y = mergeMean(a.y, my, a.count)
-			a.count++
 		}
 	}
 	for _, k := range affectedKeys {

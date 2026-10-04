@@ -3,7 +3,6 @@ package posemap
 import (
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"sync"
 )
@@ -207,11 +206,14 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 	cur := st.trajectory[len(st.trajectory)-1]
 	prevTime := cur.Time
 	newPoses := make([]Pose, 0, len(seg.Frames))
-	// staged 记录本帧触及路标的暂存“当前出现”副本：created 为真表示这是
-	// 本段内首次新观测产生的新出现（此前不存在当前有效记录）。
+	// staged 记录本帧触及路标的暂存聚合：agg 按统一规则（见 aggregate.go）
+	// 维护本段内逐条接纳观测的等权平均位置与计数；created 为真表示这是本段
+	// 首条观测产生的新出现（此前不存在当前有效记录），firstSeen 为该出现首
+	// 条观测所在帧时间。
 	type stagedLM struct {
-		occ     *occurrenceState
-		created bool
+		agg       observationAgg
+		created   bool
+		firstSeen int64
 	}
 	staged := make(map[string]stagedLM) // 本段触及路标的暂存聚合
 	touched := make(map[string]struct{})
@@ -267,49 +269,38 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		}
 		newPoses = append(newPoses, cur)
 
-		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序处理。
+		// 观测按运动完成后的位姿转换到地图坐标，同帧按输入次序逐条处理；
+		// 接纳与合并规则与回环校正重放共享同一实现（见 aggregate.go）。
 		for _, ob := range f.Observations {
-			mx, my := localToMap(cur.X, cur.Y, cur.Heading, ob.X, ob.Y)
-			// 转换结果可能因位姿/观测坐标过大而溢出：无论该路标是首次
-			// 出现、失效后再次出现，还是与有效记录合并，数值异常都优先
-			// 于距离冲突，按同一原因拒绝并携带路标标识。
-			if !isFinite(mx) || !isFinite(my) {
-				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
-			}
 			s, seen := staged[ob.ID]
 			if !seen {
 				if lm := st.landmarks[ob.ID]; lm != nil {
 					if active := lm.activeOccurrence(); active != nil {
-						// 复制当前有效出现，避免提前修改真实状态。旧出现
+						// 以当前有效出现的已提交观测为固定起点，本段观测在
+						// 其当前均值上增量合并；暂存不修改真实状态。旧出现
 						// （已失效）永不参与新观测的合并。
-						cp := *active
-						s = stagedLM{occ: &cp, created: false}
+						s.agg.seed(active.count, active.x, active.y)
 					}
 				}
-				if s.occ == nil {
-					// 从未出现或最近一次已失效：本次为新的一次出现，
-					// 编号在提交时确定，观测计数从 1 开始。
-					s = stagedLM{
-						occ: &occurrenceState{
-							x: mx, y: my, count: 1,
-							firstSeenTime: f.Time, hasFirstSeen: true,
-							active: true,
-						},
-						created: true,
-					}
-					staged[ob.ID] = s
-					touched[ob.ID] = struct{}{}
-					continue
+				if s.agg.count == 0 {
+					// 从未出现或最近一次已失效：本次为新的一次出现，编号在
+					// 提交时确定，首条观测计数从 1 开始。
+					s.created = true
+					s.firstSeen = f.Time
 				}
-				staged[ob.ID] = s
 			}
-			occ := s.occ
-			if math.Hypot(mx-occ.x, my-occ.y) > m.state.config.MergeDistance {
+			// 转换、非有限优先、首条建点、距离判定（恰含上限）、增量平均
+			// 与计数全部走统一规则。
+			switch s.agg.admit(cur, ob, st.config.MergeDistance) {
+			case obsNonFinite:
+				// 转换结果可能因位姿/观测坐标过大而溢出：无论该路标是首次
+				// 出现、失效后再次出现，还是与有效记录合并，数值异常都优先
+				// 于距离冲突，按同一原因拒绝并携带路标标识。
+				return ImportResult{}, &RejectError{Kind: RejectNonFinite, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
+			case obsConflict:
 				return ImportResult{}, &RejectError{Kind: RejectLandmarkConflict, Frame: i, HasFrame: true, Landmark: ob.ID, HasLandmark: true}
 			}
-			occ.x = mergeMean(occ.x, mx, occ.count)
-			occ.y = mergeMean(occ.y, my, occ.count)
-			occ.count++
+			staged[ob.ID] = s
 			touched[ob.ID] = struct{}{}
 		}
 
@@ -345,18 +336,28 @@ func (m *Map) ImportSegment(seg Segment) (ImportResult, error) {
 		old, ok := st.landmarks[id]
 		if s.created {
 			// 新的一次出现：可能是该标识的首次出现，也可能接在已失效的
-			// 历次出现之后。编号即追加后的切片长度。
+			// 历次出现之后。编号即追加后的切片长度；位置/计数取自暂存聚合。
+			occ := &occurrenceState{
+				x: s.agg.x, y: s.agg.y, count: s.agg.count,
+				firstSeenTime: s.firstSeen, hasFirstSeen: true,
+				active: true,
+			}
 			lm := old
 			if lm == nil {
 				lm = &landmarkState{}
 			}
-			lm.appearances = append(lm.appearances, s.occ)
+			lm.appearances = append(lm.appearances, occ)
 			st.landmarks[id] = lm
 			undo[id] = undoLandmark{lm: old, ok: ok, created: true}
 		} else {
-			// 更新既有当前有效出现（暂存副本替换原指针，旧出现原样保留）。
-			replaced := old.appearances[len(old.appearances)-1]
-			old.appearances[len(old.appearances)-1] = s.occ
+			// 更新既有当前有效出现：复制原出现（保留固定旧贡献等元数据），
+			// 仅把位置与计数换成暂存聚合结果，再以副本替换原指针，旧出现
+			// 原样保留。
+			src := old.appearances[len(old.appearances)-1]
+			occ := *src
+			occ.x, occ.y, occ.count = s.agg.x, s.agg.y, s.agg.count
+			replaced := src
+			old.appearances[len(old.appearances)-1] = &occ
 			undo[id] = undoLandmark{lm: old, ok: ok, created: false, replaced: replaced}
 		}
 	}
