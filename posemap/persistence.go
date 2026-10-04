@@ -405,13 +405,11 @@ func validateLoaded(fd *fileData) error {
 	if len(fd.Sources) != 0 && len(fd.Sources) != len(fd.Trajectory)-1 {
 		return fmt.Errorf("%w: frame sources length %d for %d frames", ErrCorrupt, len(fd.Sources), len(fd.Trajectory)-1)
 	}
-	timeAt := func(t int64) bool {
-		for _, p := range fd.Trajectory {
-			if p.Time == t {
-				return true
-			}
-		}
-		return false
+	// poseIndex 给出每个已导入帧时间在轨迹中的下标。trajectory[0] 是初始
+	// 位姿，不是可校正帧，故不放入：锚点/结束时间命中它即视为损坏。
+	poseIndex := make(map[int64]int, len(fd.Trajectory)-1)
+	for i := 1; i < len(fd.Trajectory); i++ {
+		poseIndex[fd.Trajectory[i].Time] = i
 	}
 	seenIDs := make(map[string]struct{}, len(fd.Landmarks))
 	for _, lm := range fd.Landmarks {
@@ -551,7 +549,11 @@ func validateLoaded(fd *fileData) error {
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
 	for _, cr := range fd.Corrections {
-		if cr.ID == "" || !timeAt(cr.Anchor) || !timeAt(cr.EndTime) || cr.Anchor > cr.EndTime {
+		anchorIdx, anchorOK := poseIndex[cr.Anchor]
+		endIdx, endOK := poseIndex[cr.EndTime]
+		// 锚点与结束时间必须准确命中已导入帧：不能是初始位姿，也不能借用
+		// 相邻帧；anchor <= end（二者相同即只校正一帧）。
+		if cr.ID == "" || !anchorOK || !endOK || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
 		}
 		if len(cr.Poses) == 0 {
@@ -560,6 +562,21 @@ func validateLoaded(fd *fileData) error {
 		for _, pc := range cr.Poses {
 			if !finitePose(pc.Before) || !finitePose(pc.After) {
 				return fmt.Errorf("%w: correction %s has non-finite pose", ErrCorrupt, cr.ID)
+			}
+		}
+		// 记录必须完整描述声明范围（锚点到结束时间，两端都包含）内的全部
+		// 已导入帧：恰好每帧一份校正前后位姿，按轨迹时间排列，同一份前后
+		// 位姿的时间必须相同且就是对应帧的时间。漏掉一帧、重复、错序、加入
+		// 范围外的帧，或把前后时间写成两个不同帧，都使整份文件按损坏拒绝。
+		// 这里只核对覆盖的帧及时间，不要求快照中的位置、朝向与方差等于当前
+		// 轨迹：后来对相同范围再做校正是正常使用，较早记录保留当时的前后值。
+		if want := endIdx - anchorIdx + 1; len(cr.Poses) != want {
+			return fmt.Errorf("%w: correction %s covers %d frames but records %d pose changes", ErrCorrupt, cr.ID, want, len(cr.Poses))
+		}
+		for i, pc := range cr.Poses {
+			frameTime := fd.Trajectory[anchorIdx+i].Time
+			if pc.Before.Time != frameTime || pc.After.Time != frameTime {
+				return fmt.Errorf("%w: correction %s pose change %d has times %d/%d, want frame time %d", ErrCorrupt, cr.ID, i, pc.Before.Time, pc.After.Time, frameTime)
 			}
 		}
 		for _, lc := range cr.Landmarks {
