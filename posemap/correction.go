@@ -77,6 +77,10 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	// 相对位姿整体旋转 δ；平移锚点到目标位置。
 	dHeading := normalizeAngle(newHeading - oldAnchor.Heading)
 	cosD, sinD := math.Cos(dHeading), math.Sin(dHeading)
+	// 目标位姿与锚点当前位姿一致（仅调整方差）时，各帧位置与朝向保持
+	// 原值，不做“减锚点、旋转、平移”的推演：轨迹坐标横跨正负两侧且
+	// 幅值极大时，坐标差会溢出为无穷，恒等变换也会被误判为非有限。
+	poseUnchanged := dHeading == 0 && tgt.X == oldAnchor.X && tgt.Y == oldAnchor.Y
 
 	// ---- 在副本上推演新位姿，真实状态此时保持不变 ----
 	next := append([]Pose(nil), st.trajectory...)
@@ -86,14 +90,15 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		if j > anchorIdx {
 			accumVar += st.sources[j-1].moveVariance
 		}
-		dx := old.X - oldAnchor.X
-		dy := old.Y - oldAnchor.Y
-		np := Pose{
-			Time:     old.Time,
-			X:        tgt.X + cosD*dx - sinD*dy,
-			Y:        tgt.Y + sinD*dx + cosD*dy,
-			Heading:  normalizeAngle(old.Heading + dHeading),
-			Variance: accumVar,
+		np := Pose{Time: old.Time, Variance: accumVar}
+		if poseUnchanged {
+			np.X, np.Y, np.Heading = old.X, old.Y, old.Heading
+		} else {
+			dx := old.X - oldAnchor.X
+			dy := old.Y - oldAnchor.Y
+			np.X = tgt.X + cosD*dx - sinD*dy
+			np.Y = tgt.Y + sinD*dx + cosD*dy
+			np.Heading = normalizeAngle(old.Heading + dHeading)
 		}
 		if !isFinite(np.X) || !isFinite(np.Y) || !isFinite(np.Heading) || !isFinite(np.Variance) {
 			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
