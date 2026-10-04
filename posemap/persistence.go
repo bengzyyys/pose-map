@@ -530,6 +530,81 @@ func validateLoaded(fd *fileData) error {
 				}
 			}
 		}
+
+		// 次数核对之后再核对每次出现保存的位置：依据是该次出现实际接纳的
+		// 观测，以及这些观测所在帧“当前保存”的位姿（正常回环校正后位姿
+		// 已改变，核对的就是当前轨迹对应的位置；校正记录中的旧快照不参与、
+		// 也不要求当前位置等于它们）。按帧时间与同帧观测的原输入次序逐条
+		// 重放，旧文件缺少逐帧来源的固定贡献作为等权平均起点（seed），
+		// 接纳与等权合并规则与导入/校正完全一致（见 aggregate.go）：同帧
+		// 多条观测各自参与、空观测帧不增加贡献，已失效的旧出现同样重放，
+		// 两次出现的观测凭时间边界各归各的、互不混用。重放得到的位置与计数
+		// 必须和保存值逐位一致；合并距离只是接纳规则的一部分（重放时同样
+		// 执行），不能当作保存位置偏差的容许范围。次数检查已保证贡献总数，
+		// 此处任一观测重放异常（非有限/超距）必然使计数或位置对不上，按
+		// 损坏拒绝。完全没有逐帧来源的纯旧文件 sources 缺省，整段核对跳过，
+		// 不要求补造观测。
+		type occRef struct {
+			id      string
+			num     int
+			x, y    float64
+			count   int
+			legacyC int
+			legacyX float64
+			legacyY float64
+		}
+		type occKey struct {
+			id  string
+			num int
+		}
+		var refs []occRef
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) == 0 {
+				refs = append(refs, occRef{
+					id: lm.ID, num: 1, x: lm.X, y: lm.Y, count: lm.Count,
+					legacyC: lm.LegacyCount, legacyX: lm.LegacyMX, legacyY: lm.LegacyMY,
+				})
+				continue
+			}
+			for _, oj := range lm.Occurrences {
+				refs = append(refs, occRef{
+					id: lm.ID, num: oj.Number, x: oj.X, y: oj.Y, count: oj.Count,
+					legacyC: oj.LegacyCount, legacyX: oj.LegacyMX, legacyY: oj.LegacyMY,
+				})
+			}
+		}
+		aggs := make(map[occKey]*observationAgg, len(refs))
+		for _, r := range refs {
+			a := &observationAgg{}
+			if r.legacyC > 0 {
+				// 旧文件帧的观测无法重放：其固定旧贡献按原有次数与平均
+				// 位置作为起点，不能当成零，也不能用缺少依据的帧数代替。
+				a.seed(r.legacyC, r.legacyX, r.legacyY)
+			}
+			aggs[occKey{id: r.id, num: r.num}] = a
+		}
+		for k, src := range fd.Sources {
+			if src == nil {
+				continue // 旧地图帧：其贡献已固定在对应出现的 legacy 起点中
+			}
+			pose := fd.Trajectory[k+1]
+			t := pose.Time
+			for _, ob := range src.Observations {
+				// 归属与计数核对使用同一组时间边界：观测只属于它所在帧
+				// 当时的那次出现，失效后再现的观测不会并入旧出现。
+				num := occurrenceNumberAt(bounds[ob.ID], t)
+				a := aggs[occKey{id: ob.ID, num: num}]
+				if reason := a.admit(pose, ob, fd.Config.MergeDistance); reason != obsAccepted {
+					return fmt.Errorf("%w: observation of landmark %s at frame time %d is not reproducible from saved poses", ErrCorrupt, ob.ID, t)
+				}
+			}
+		}
+		for _, r := range refs {
+			a := aggs[occKey{id: r.id, num: r.num}]
+			if a.count != r.count || a.x != r.x || a.y != r.y {
+				return fmt.Errorf("%w: landmark %s occurrence %d is saved at (%v,%v) but its accepted observations and saved poses place it at (%v,%v) with %d observations", ErrCorrupt, r.id, r.num, r.x, r.y, a.x, a.y, a.count)
+			}
+		}
 	}
 	segIDs := make(map[string]struct{}, len(fd.Segments))
 	for _, sg := range fd.Segments {
