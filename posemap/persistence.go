@@ -530,6 +530,80 @@ func validateLoaded(fd *fileData) error {
 				}
 			}
 		}
+
+		// 位置核对：次数相符只说明观测“条数”对得上，还必须核对保存的路标
+		// 位置确实是这些观测依据当前保存位姿重放后的等权平均。每条来源观测
+		// 按所在帧当前保存的位姿转换到地图坐标，按帧时间升序、同帧按输入
+		// 次序，归入各自出现分别重放；同帧对同一标识的多条观测各自参与，
+		// 空观测帧不增加贡献。转换、接纳、增量平均与计数全部复用导入/校正
+		// 的同一规则（见 aggregate.go），旧文件固定旧贡献（LegacyCount 次
+		// 平均）作为聚合起点——不能当成零，也不能用缺少依据的帧数代替。
+		// 回环校正后保存的文件按当前轨迹重放即得到当前位置，不要求等于校正
+		// 记录里的历史快照；各次出现分别核对，已失效的出现同样核对。合并
+		// 距离只是导入/校正时的接纳门槛，不是保存位置偏差的容许范围：重放
+		// 中出现非有限结果或距离冲突，或最终平均位置与保存位置不完全一致，
+		// 都按损坏拒绝。纯旧文件没有 sources、null 旧帧没有依据，均不重放。
+		type posKey struct {
+			id  string
+			num int
+		}
+		posAggs := make(map[posKey]*observationAgg, len(fd.Landmarks))
+		seedPosAgg := func(id string, num, legacyCount int, lx, ly float64) {
+			a := &observationAgg{}
+			if legacyCount > 0 {
+				a.seed(legacyCount, lx, ly)
+			}
+			posAggs[posKey{id: id, num: num}] = a
+		}
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) == 0 {
+				// 旧版平铺路标即第 1 次出现。
+				seedPosAgg(lm.ID, 1, lm.LegacyCount, lm.LegacyMX, lm.LegacyMY)
+				continue
+			}
+			for _, oj := range lm.Occurrences {
+				seedPosAgg(lm.ID, oj.Number, oj.LegacyCount, oj.LegacyMX, oj.LegacyMY)
+			}
+		}
+		for k, src := range fd.Sources {
+			if src == nil {
+				continue // 旧地图帧：无逐帧依据，其贡献固定在旧贡献起点中
+			}
+			pose := fd.Trajectory[k+1]
+			for _, ob := range src.Observations {
+				// 归属（存在性与时间边界）已在上面校验，num 必非 0。
+				num := occurrenceNumberAt(bounds[ob.ID], pose.Time)
+				a := posAggs[posKey{id: ob.ID, num: num}]
+				switch a.admit(pose, ob, fd.Config.MergeDistance) {
+				case obsNonFinite:
+					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d is non-finite", ErrCorrupt, ob.ID, num, pose.Time)
+				case obsConflict:
+					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d violates merge distance", ErrCorrupt, ob.ID, num, pose.Time)
+				}
+			}
+		}
+		checkPosition := func(id string, num int, x, y float64) error {
+			a := posAggs[posKey{id: id, num: num}]
+			// 次数核对已保证 a.count 与记录次数一致（含旧贡献起点），这里只
+			// 核对位置：保存位置必须与按依据重放出的等权平均完全一致。
+			if a.x != x || a.y != y {
+				return fmt.Errorf("%w: landmark %s occurrence %d is saved at (%v,%v) but its observations replay to (%v,%v)", ErrCorrupt, id, num, x, y, a.x, a.y)
+			}
+			return nil
+		}
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) == 0 {
+				if err := checkPosition(lm.ID, 1, lm.X, lm.Y); err != nil {
+					return err
+				}
+				continue
+			}
+			for _, oj := range lm.Occurrences {
+				if err := checkPosition(lm.ID, oj.Number, oj.X, oj.Y); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	segIDs := make(map[string]struct{}, len(fd.Segments))
 	for _, sg := range fd.Segments {
