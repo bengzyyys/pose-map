@@ -473,6 +473,16 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: multiple active occurrences for landmark %s", ErrCorrupt, lm.ID)
 		}
 	}
+	// 各路标历次出现的时间边界：来源帧的观测归属核对与校正记录路标列表
+	// 核对共用同一份边界、同一套归属规则（见 occurrence.go）。旧文件缺省
+	// sources（解码为 nil）时不构建，两处核对都不进行。
+	var bounds map[string][]occurrenceWindow
+	if len(fd.Sources) != 0 {
+		bounds = make(map[string][]occurrenceWindow, len(fd.Landmarks))
+		for _, lm := range fd.Landmarks {
+			bounds[lm.ID] = occurrenceWindowsOf(lm)
+		}
+	}
 	// 校验每条带逐帧依据的观测来源：观测路标必须存在，且所在帧时间必须
 	// 落入该路标某一次出现的时间边界（共享规则见 occurrence.go）。旧出现
 	// 已失效不代表其历史观测无效；同一标识两次出现之间（如 200 失效、
@@ -480,10 +490,6 @@ func validateLoaded(fd *fileData) error {
 	// 逐帧依据的旧地图，其观测不在这里（也无法）核验；旧版平铺路标视为
 	// 一次无边界的有效出现，因此旧地图后来追加的来源帧仍按此规则检查。
 	if len(fd.Sources) != 0 {
-		bounds := make(map[string][]occurrenceWindow, len(fd.Landmarks))
-		for _, lm := range fd.Landmarks {
-			bounds[lm.ID] = occurrenceWindowsOf(lm)
-		}
 		// 归属校验的同时按（路标，出现编号）统计来源观测条数：每条观测
 		// 各算一次，同帧重复观测同一标识不去重，空观测帧不计。null 帧
 		// 缺少逐帧依据，其贡献已固定在出现的旧观测计数中，不在此统计，
@@ -616,6 +622,11 @@ func validateLoaded(fd *fileData) error {
 		segIDs[sg.ID] = struct{}{}
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
+	// corrOccKey 标识校正范围内被观测涉及的某个路标某一次出现。
+	type corrOccKey struct {
+		id  string
+		num int
+	}
 	for _, cr := range fd.Corrections {
 		if cr.ID == "" || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
@@ -662,6 +673,65 @@ func validateLoaded(fd *fileData) error {
 				!isFinite(lc.After.X) || !isFinite(lc.After.Y) ||
 				lc.Before.Count < 1 || lc.After.Count < 1 {
 				return fmt.Errorf("%w: correction %s has invalid landmark change", ErrCorrupt, cr.ID)
+			}
+		}
+		// 路标列表必须恰好描述记录范围（锚点帧到结束帧，两端包含；之后
+		// 追加的帧不属于范围）内逐帧观测实际涉及的路标出现：范围内被观测
+		// 到的每个（路标，出现编号）必须恰好有一条前后记录，同一次出现被
+		// 多帧或同帧多条观测涉及也只记一条；少记、多记、重复、或把出现
+		// 编号改指该范围没有涉及的另一出现，都按损坏拒绝整份文件，而不是
+		// 只看条目里的坐标与次数是否合法。归属沿用与来源校验相同的时间边
+		// 界规则：同一标识失效后再现属于不同出现，即使位置相同也分别对应；
+		// 已失效的旧出现只要范围内（含失效时刻）有它的观测就必须在列表
+		// 中，不因当前区域查询不再返回它而被排除；范围外帧（如记录之后
+		// 才再现的新出现）的观测不计入。范围内没有任何路标观测时列表必须
+		// 为空，非空即损坏。仅对范围内逐帧依据完整的校正做此核对：范围内
+		// 含 null 旧帧的校正缺少逐帧依据，保留旧地图的既有打开规则，不凭
+		// 推测要求补造观测。
+		if bounds != nil {
+			fullyBased := true
+			for k := anchorIdx - 1; k <= endIdx-1; k++ {
+				if fd.Sources[k] == nil {
+					fullyBased = false
+					break
+				}
+			}
+			if fullyBased {
+				want := make(map[corrOccKey]struct{})
+				for j := anchorIdx; j <= endIdx; j++ {
+					t := fd.Trajectory[j].Time
+					for _, ob := range fd.Sources[j-1].Observations {
+						// 归属已在上方的来源校验中确认（路标存在、必有唯一
+						// 接纳出现），这里同样计算以保持两处规则一致。
+						want[corrOccKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
+					}
+				}
+				got := make(map[corrOccKey]struct{}, len(cr.Landmarks))
+				for _, lc := range cr.Landmarks {
+					num := lc.Occurrence
+					if num == 0 {
+						num = 1 // 更早版本写出的校正记录不带编号，按第 1 次出现解释
+					}
+					wins, ok := bounds[lc.ID]
+					if !ok || num < 1 || num > len(wins) {
+						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d not touched by its range", ErrCorrupt, cr.ID, lc.ID, num)
+					}
+					key := corrOccKey{id: lc.ID, num: num}
+					if _, dup := got[key]; dup {
+						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
+					}
+					got[key] = struct{}{}
+				}
+				for key := range want {
+					if _, ok := got[key]; !ok {
+						return fmt.Errorf("%w: correction %s misses landmark %s occurrence %d observed in its range", ErrCorrupt, cr.ID, key.id, key.num)
+					}
+				}
+				for key := range got {
+					if _, ok := want[key]; !ok {
+						return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d with no observation in its range", ErrCorrupt, cr.ID, key.id, key.num)
+					}
+				}
 			}
 		}
 		if _, dup := corrIDs[cr.ID]; dup {
