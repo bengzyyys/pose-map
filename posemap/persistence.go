@@ -405,14 +405,6 @@ func validateLoaded(fd *fileData) error {
 	if len(fd.Sources) != 0 && len(fd.Sources) != len(fd.Trajectory)-1 {
 		return fmt.Errorf("%w: frame sources length %d for %d frames", ErrCorrupt, len(fd.Sources), len(fd.Trajectory)-1)
 	}
-	timeAt := func(t int64) bool {
-		for _, p := range fd.Trajectory {
-			if p.Time == t {
-				return true
-			}
-		}
-		return false
-	}
 	seenIDs := make(map[string]struct{}, len(fd.Landmarks))
 	for _, lm := range fd.Landmarks {
 		if lm.ID == "" {
@@ -551,13 +543,39 @@ func validateLoaded(fd *fileData) error {
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
 	for _, cr := range fd.Corrections {
-		if cr.ID == "" || !timeAt(cr.Anchor) || !timeAt(cr.EndTime) || cr.Anchor > cr.EndTime {
+		if cr.ID == "" || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
 		}
-		if len(cr.Poses) == 0 {
-			return fmt.Errorf("%w: correction %s has no affected poses", ErrCorrupt, cr.ID)
+		// 锚点与结束时间必须准确命中已导入帧：trajectory[0] 是初始位姿，
+		// 不是可校正的帧，也不能用相邻帧的时间代替。轨迹时间已在前面
+		// 校验为严格递增，命中即唯一。
+		anchorIdx, endIdx := -1, -1
+		for j := 1; j < len(fd.Trajectory); j++ {
+			if fd.Trajectory[j].Time == cr.Anchor {
+				anchorIdx = j
+			}
+			if fd.Trajectory[j].Time == cr.EndTime {
+				endIdx = j
+			}
 		}
-		for _, pc := range cr.Poses {
+		if anchorIdx < 0 || endIdx < 0 {
+			return fmt.Errorf("%w: correction %s range does not hit imported frames", ErrCorrupt, cr.ID)
+		}
+		// 记录必须恰好覆盖 [anchor, end] 内的每一帧：位姿条目数量等于
+		// 范围内帧数，按轨迹时间次序一一对应，且同一份前后位姿的时间
+		// 相同并就是对应帧的时间。缺失、重复、错序、额外加入范围外的
+		// 帧，或把前后时间写成两个不同帧，都使记录不能完整描述声明的
+		// 范围，按损坏拒绝。这里只核对覆盖的帧及时间：快照中的位置、
+		// 朝向和方差是提交时的历史值，不要求等于当前轨迹（后来对相同
+		// 范围再校正、或之后导入新帧，都不影响既有记录的合法性）。
+		if len(cr.Poses) != endIdx-anchorIdx+1 {
+			return fmt.Errorf("%w: correction %s does not cover every frame in its range", ErrCorrupt, cr.ID)
+		}
+		for i, pc := range cr.Poses {
+			ft := fd.Trajectory[anchorIdx+i].Time
+			if pc.Before.Time != ft || pc.After.Time != ft {
+				return fmt.Errorf("%w: correction %s pose entry %d does not match frame time %d", ErrCorrupt, cr.ID, i, ft)
+			}
 			if !finitePose(pc.Before) || !finitePose(pc.After) {
 				return fmt.Errorf("%w: correction %s has non-finite pose", ErrCorrupt, cr.ID)
 			}
