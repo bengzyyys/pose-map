@@ -669,7 +669,20 @@ func validateLoaded(fd *fileData) error {
 		}
 		corrIDs[cr.ID] = struct{}{}
 	}
+	// 路标记录按标识索引，供失效记录与出现历史的交叉核对使用。
+	lmByID := make(map[string]*landmarkJSON, len(fd.Landmarks))
+	for i := range fd.Landmarks {
+		lmByID[fd.Landmarks[i].ID] = &fd.Landmarks[i]
+	}
 	invalIDs := make(map[string]struct{}, len(fd.Invalidations))
+	// invalTriples 记录每条失效操作实际引用的（操作标识，路标，出现编号）
+	// 三元组，供反向核对：每个已失效出现都必须是某条操作记录里的实际条目。
+	type invalTriple struct {
+		op  string
+		lm  string
+		num int
+	}
+	invalTriples := make(map[invalTriple]struct{}, len(fd.Invalidations))
 	for _, iv := range fd.Invalidations {
 		if iv.ID == "" || iv.Reason == "" || iv.Hash == "" || len(iv.Landmarks) == 0 {
 			return fmt.Errorf("%w: invalid invalidation record", ErrCorrupt)
@@ -687,6 +700,52 @@ func validateLoaded(fd *fileData) error {
 				return fmt.Errorf("%w: invalidation %s lists %s twice", ErrCorrupt, iv.ID, l.ID)
 			}
 			lmSeen[l.ID] = struct{}{}
+		}
+		// 交叉核对：成功失效结果里的每个（路标标识，出现编号）必须准确
+		// 指向该路标历史中同编号的那次出现，不能改指同一路标的其他出现，
+		// 也不能因为路标后来再次出现就把旧结果指向最新记录。被指出现必须
+		// 已经失效，且其上记录的失效操作标识、失效时间、失效原因都与这条
+		// 操作记录一致——时间与原因各自再合理也不够，实际由另一条操作撤下
+		// 时不能仅凭相同时间/原因认可。旧版平铺路标视为第 1 次有效出现，
+		// 不可能被失效记录引用（引用即损坏）。一条操作同时撤下多个路标时，
+		// 任意一个条目不满足对应关系都拒绝打开整个文件。
+		for _, l := range iv.Landmarks {
+			lm := lmByID[l.ID]
+			if lm == nil {
+				return fmt.Errorf("%w: invalidation %s result points to unknown landmark %s", ErrCorrupt, iv.ID, l.ID)
+			}
+			if len(lm.Occurrences) == 0 {
+				return fmt.Errorf("%w: invalidation %s result points to flat legacy landmark %s which has no invalidated occurrence", ErrCorrupt, iv.ID, l.ID)
+			}
+			if l.Occurrence > len(lm.Occurrences) {
+				return fmt.Errorf("%w: invalidation %s result points to landmark %s occurrence %d which does not exist", ErrCorrupt, iv.ID, l.ID, l.Occurrence)
+			}
+			// 出现编号连续性已在上方路标校验中强制，该下标处编号即 l.Occurrence。
+			oj := lm.Occurrences[l.Occurrence-1]
+			if oj.Active {
+				return fmt.Errorf("%w: invalidation %s result points to landmark %s occurrence %d which is still active", ErrCorrupt, iv.ID, l.ID, l.Occurrence)
+			}
+			if oj.InvalidOpID != iv.ID || oj.InvalidTime != iv.Time || oj.InvalidReason != iv.Reason {
+				return fmt.Errorf("%w: invalidation %s result for landmark %s occurrence %d does not match its saved invalidation (op %q, time %d, reason %q)", ErrCorrupt, iv.ID, l.ID, l.Occurrence, oj.InvalidOpID, oj.InvalidTime, oj.InvalidReason)
+			}
+			invalTriples[invalTriple{op: iv.ID, lm: l.ID, num: l.Occurrence}] = struct{}{}
+		}
+	}
+	// 反向核对：每个已失效出现都必须能在失效操作序列中找到引用同一（操作，
+	// 路标，出现编号）三元组的条目。正向核对已保证被引用出现的失效时间与
+	// 原因和引用方一致；此处堵住另一方向的矛盾：出现凭空携带失效信息、
+	// 声称撤下它的操作记录实际指向另一次出现，或两次出现声称被同一操作
+	// 撤下（一次操作对同一路标只会撤下当时唯一的有效出现）。旧地图没有
+	// 失效操作时，平铺路标视为有效、不携带失效信息，不会触发；旧地图后来
+	// 产生的失效操作同样在上述核对之列，不要求补齐原本缺失的逐帧观测。
+	for _, lm := range fd.Landmarks {
+		for _, oj := range lm.Occurrences {
+			if oj.Active {
+				continue
+			}
+			if _, ok := invalTriples[invalTriple{op: oj.InvalidOpID, lm: lm.ID, num: oj.Number}]; !ok {
+				return fmt.Errorf("%w: landmark %s occurrence %d is marked invalidated by operation %q which does not record that invalidation", ErrCorrupt, lm.ID, oj.Number, oj.InvalidOpID)
+			}
 		}
 	}
 	return nil
