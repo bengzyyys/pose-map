@@ -5,6 +5,58 @@ import (
 	"sort"
 )
 
+// poseShift 描述一次回环校正对轨迹施加的同一次刚体重定位：锚点落到目标
+// 位置、朝向归一到 [-π,π)；从锚点到末帧的其余帧与锚点一起平移旋转，保留
+// 各帧相对锚点的位置关系与朝向差。提交校正（Correct）与打开地图时的校正
+// 记录几何核对（validateLoaded，见 persistence.go）共用这同一份规则与
+// 运算次序，两处对“校正后位置与朝向”的理解因此始终一致。
+type poseShift struct {
+	x, y       float64 // 目标位置，即锚点校正后位置
+	heading    float64 // 目标朝向归一到 [-π,π)，即锚点校正后朝向
+	anchorX    float64 // 锚点校正前位置
+	anchorY    float64
+	dHeading   float64 // 归一后的最短朝向差，即各帧叠加的旋转角
+	cosD, sinD float64 // 旋转角的余弦与正弦
+	identity   bool    // 只调方差的恒等校正：位置与朝向保持原值
+}
+
+// newPoseShift 按提交目标与锚点校正前位姿构造重定位。目标朝向先归一，
+// 旋转角取归一后的最短朝向差。目标位置与锚点原位置完全相同、目标朝向归
+// 一后与原朝向等价（旋转角为 0）时是恒等校正：几何上没有任何平移或旋
+// 转，校正前后位姿必须完全相同。恒等校正不能套用旋转平移公式——公式会
+// 先求相对锚点的偏移，轨迹横跨 ±1e308 这类大坐标时该差值先溢出为
+// ±Inf、再参与浮点运算退化为 NaN，使本应成功的校正被误判为数值异常；
+// 恒等校正直接保留原位姿。
+func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
+	heading := normalizeAngle(tgt.Heading)
+	dHeading := normalizeAngle(heading - anchorBefore.Heading)
+	return poseShift{
+		x:        tgt.X,
+		y:        tgt.Y,
+		heading:  heading,
+		anchorX:  anchorBefore.X,
+		anchorY:  anchorBefore.Y,
+		dHeading: dHeading,
+		cosD:     math.Cos(dHeading),
+		sinD:     math.Sin(dHeading),
+		identity: dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
+	}
+}
+
+// apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；否则把校
+// 正前相对锚点的偏移随锚点一起旋转平移，朝向叠加同一旋转角并归一到
+// [-π,π)。帧时间与方差不属于几何规则，由调用方处理。
+func (s poseShift) apply(before Pose) (x, y, heading float64) {
+	if s.identity {
+		return before.X, before.Y, before.Heading
+	}
+	dx := before.X - s.anchorX
+	dy := before.Y - s.anchorY
+	return s.x + s.cosD*dx - s.sinD*dy,
+		s.y + s.sinD*dx + s.cosD*dy,
+		normalizeAngle(before.Heading + s.dHeading)
+}
+
 // Correct 提交一次已确认回环校正。
 //
 // req.ID 必须非空；req.Anchor 必须准确命中一个已导入帧的时间（不能是
@@ -73,17 +125,9 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 
 	oldAnchor := st.trajectory[anchorIdx]
-	newHeading := normalizeAngle(tgt.Heading)
-	// 相对位姿整体旋转 δ；平移锚点到目标位置。
-	dHeading := normalizeAngle(newHeading - oldAnchor.Heading)
-	cosD, sinD := math.Cos(dHeading), math.Sin(dHeading)
-	// 目标位置与朝向与锚点当前值一致（朝向按角度等价比较：δ 归一后为 0）
-	// 时是只改方差的恒等校正：几何上没有任何平移或旋转，校正前后位姿必须
-	// 完全相同。此时仍套用旋转平移公式会先求 old-oldAnchor 的相对偏移，当
-	// 轨迹横跨 ±1e308 这类大坐标时该差值先溢出为 ±Inf、再参与浮点运算退化
-	// 为 NaN，使本应成功的校正被误判为 non_finite。恒等校正直接保留原位姿，
-	// 只按累计规则更新方差。
-	identity := dHeading == 0 && tgt.X == oldAnchor.X && tgt.Y == oldAnchor.Y
+	// 锚点到末帧的整体平移旋转规则（含只调方差的恒等情形）与打开地图时
+	// 的记录几何核对共享同一实现，见上方 poseShift。
+	shift := newPoseShift(tgt, oldAnchor)
 
 	// ---- 在副本上推演新位姿，真实状态此时保持不变 ----
 	next := append([]Pose(nil), st.trajectory...)
@@ -93,25 +137,13 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		if j > anchorIdx {
 			accumVar += st.sources[j-1].moveVariance
 		}
-		var np Pose
-		if identity {
-			np = Pose{
-				Time:     old.Time,
-				X:        old.X,
-				Y:        old.Y,
-				Heading:  old.Heading,
-				Variance: accumVar,
-			}
-		} else {
-			dx := old.X - oldAnchor.X
-			dy := old.Y - oldAnchor.Y
-			np = Pose{
-				Time:     old.Time,
-				X:        tgt.X + cosD*dx - sinD*dy,
-				Y:        tgt.Y + sinD*dx + cosD*dy,
-				Heading:  normalizeAngle(old.Heading + dHeading),
-				Variance: accumVar,
-			}
+		x, y, heading := shift.apply(old)
+		np := Pose{
+			Time:     old.Time,
+			X:        x,
+			Y:        y,
+			Heading:  heading,
+			Variance: accumVar,
 		}
 		if !isFinite(np.X) || !isFinite(np.Y) || !isFinite(np.Heading) || !isFinite(np.Variance) {
 			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}

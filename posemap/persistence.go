@@ -752,40 +752,30 @@ func validateLoaded(fd *fileData) error {
 			// 几何核对：整条记录必须描述同一次平移和旋转。只核对该记录
 			// 自身保存的校正前后值与目标，不要求历史快照等于当前轨迹——
 			// 后来对重叠范围再校正、或在结束时间之后追加轨迹，都不改写旧
-			// 记录，也不能使原本合法的旧记录被拒绝。旋转角、余弦正弦与
-			// 期望位姿的运算次序与 Correct 提交时完全一致（见
-			// correction.go），本包写出的合法记录重算出的期望值与保存值
-			// 逐位相同；这里另按容差接纳浮点重算误差。锚点的校正后位置
-			// 必须是目标位置、朝向必须是目标朝向归一到 [-π,π) 的结果；
-			// 其余帧必须与锚点一起做同一次刚体重定位：保留校正前相对锚
-			// 点的位置关系与朝向差。每一帧都逐一核对——只有锚点与末帧
-			// 正确而中间一帧位置偏离或单独转向，同样按损坏拒绝；范围只有
-			// 锚点一帧时本核对即只针对该帧。坐标容差为 1e-9 乘以
-			// 1、期望值绝对值、保存值绝对值三者的最大值；朝向按最短角
-			// 度差比较，容差 1e-9 弧度。容差与路标合并距离无关：合并距
-			// 离只是导入/校正时的观测接纳门槛，不能用来放过记录内部的
-			// 几何矛盾。目标位置/朝向与锚点校正前完全相同（角度等价）
-			// 时是恒等（只调方差）校正，期望几何直接取校正前值，与
+			// 记录，也不能使原本合法的旧记录被拒绝。重定位规则与 Correct
+			// 提交时共享同一实现（poseShift，见 correction.go）：旋转角、
+			// 余弦正弦与期望位姿的运算次序完全一致，本包写出的合法记录重
+			// 算出的期望值与保存值逐位相同；这里另按容差接纳浮点重算误
+			// 差。锚点的校正后位置必须是目标位置、朝向必须是目标朝向归一
+			// 到 [-π,π) 的结果；其余帧必须与锚点一起做同一次刚体重定
+			// 位：保留校正前相对锚点的位置关系与朝向差。每一帧都逐一核
+			// 对——只有锚点与末帧正确而中间一帧位置偏离或单独转向，同样
+			// 按损坏拒绝；范围只有锚点一帧时本核对即只针对该帧。坐标容差
+			// 为 1e-9 乘以 1、期望值绝对值、保存值绝对值三者的最大值；
+			// 朝向按最短角度差比较，容差 1e-9 弧度。容差与路标合并距离无
+			// 关：合并距离只是导入/校正时的观测接纳门槛，不能用来放过记
+			// 录内部的几何矛盾。目标位置/朝向与锚点校正前完全相同（角度
+			// 等价）时是恒等（只调方差）校正，期望几何直接取校正前值，与
 			// Correct 的同一分支保持一致：横跨 ±1e308 的轨迹上“相对锚
 			// 点偏移”会溢出，不能因此把合法的恒等校正误判为损坏。
 			anchorBefore := cr.Poses[0].Before
-			newHeading := normalizeAngle(cr.Target.Heading)
-			dHeading := normalizeAngle(newHeading - anchorBefore.Heading)
-			cosD, sinD := math.Cos(dHeading), math.Sin(dHeading)
-			identity := dHeading == 0 && cr.Target.X == anchorBefore.X && cr.Target.Y == anchorBefore.Y
+			shift := newPoseShift(cr.Target, anchorBefore)
 			for i, pc := range cr.Poses {
 				var wantX, wantY, wantHeading float64
-				switch {
-				case i == 0:
-					wantX, wantY, wantHeading = cr.Target.X, cr.Target.Y, newHeading
-				case identity:
-					wantX, wantY, wantHeading = pc.Before.X, pc.Before.Y, pc.Before.Heading
-				default:
-					dx := pc.Before.X - anchorBefore.X
-					dy := pc.Before.Y - anchorBefore.Y
-					wantX = cr.Target.X + cosD*dx - sinD*dy
-					wantY = cr.Target.Y + sinD*dx + cosD*dy
-					wantHeading = normalizeAngle(pc.Before.Heading + dHeading)
+				if i == 0 {
+					wantX, wantY, wantHeading = shift.x, shift.y, shift.heading
+				} else {
+					wantX, wantY, wantHeading = shift.apply(pc.Before)
 				}
 				if !coordClose(pc.After.X, wantX) {
 					return fmt.Errorf("%w: correction %s pose at frame time %d has corrected x %v but the record's target and pre-correction poses rigidly move it to %v", ErrCorrupt, cr.ID, pc.After.Time, pc.After.X, wantX)
