@@ -749,6 +749,42 @@ func validateLoaded(fd *fileData) error {
 					return fmt.Errorf("%w: correction %s pose at frame time %d has corrected variance %v but target variance %v and the motion variances after the anchor accumulate to %v", ErrCorrupt, cr.ID, pc.After.Time, pc.After.Variance, cr.Target.Variance, accum)
 				}
 			}
+			// 几何核对：整条记录必须描述同一次平移与旋转——锚点帧的校正后
+			// 位置即目标位置、朝向即目标朝向归一到 [-π,π) 的结果；其余各帧
+			// 与锚点一起移动和转向，保留校正前相对锚点的位置关系与朝向差
+			// （即 Correct 应用的同一变换，见 correction.go）。目标与锚点校正
+			// 前一致（朝向按角度等价：δ 归一后为 0）时是只改方差的恒等校正：
+			// 校正前后位置与朝向必须完全相同，此时不能套用旋转平移公式——横
+			// 跨 ±1e308 的坐标相减会先溢出为 ±Inf 再退化为 NaN，把合法记录
+			// 误判为矛盾。每一帧逐一核对：只有锚点与末帧正确而中间一帧位置
+			// 偏离或单独转向同样拒绝；范围只有锚点一帧时同样适用。坐标误差
+			// 容限为 1e-9 乘以 1、预期值绝对值、保存值绝对值三者中的最大值，
+			// 朝向按最短角度差比较、容限 1e-9 弧度；容差与路标合并距离无关，
+			// 合并距离再大也不放宽几何矛盾。核对只用本记录保存的校正前后值
+			// 与目标，不要求等于当前轨迹：后来对重叠范围的再校正或记录结束
+			// 之后追加的帧都不影响既有记录的合法性。
+			anchorBefore := cr.Poses[0].Before
+			dHeading := normalizeAngle(normalizeAngle(cr.Target.Heading) - anchorBefore.Heading)
+			cosD, sinD := math.Cos(dHeading), math.Sin(dHeading)
+			identity := dHeading == 0 && cr.Target.X == anchorBefore.X && cr.Target.Y == anchorBefore.Y
+			for _, pc := range cr.Poses {
+				var wantX, wantY, wantH float64
+				if identity {
+					wantX, wantY, wantH = pc.Before.X, pc.Before.Y, pc.Before.Heading
+				} else {
+					dx := pc.Before.X - anchorBefore.X
+					dy := pc.Before.Y - anchorBefore.Y
+					wantX = cr.Target.X + cosD*dx - sinD*dy
+					wantY = cr.Target.Y + sinD*dx + cosD*dy
+					wantH = normalizeAngle(pc.Before.Heading + dHeading)
+				}
+				if !coordClose(pc.After.X, wantX) || !coordClose(pc.After.Y, wantY) {
+					return fmt.Errorf("%w: correction %s pose at frame time %d has corrected position (%v,%v) but the record's target and pre-correction poses place it at (%v,%v)", ErrCorrupt, cr.ID, pc.After.Time, pc.After.X, pc.After.Y, wantX, wantY)
+				}
+				if diff := normalizeAngle(pc.After.Heading - wantH); math.Abs(diff) > 1e-9 {
+					return fmt.Errorf("%w: correction %s pose at frame time %d has corrected heading %v but the record's target and pre-correction poses place it at %v", ErrCorrupt, cr.ID, pc.After.Time, pc.After.Heading, wantH)
+				}
+			}
 		}
 		for _, lc := range cr.Landmarks {
 			if lc.ID == "" {
@@ -899,6 +935,15 @@ func validateLoaded(fd *fileData) error {
 
 func finitePose(p Pose) bool {
 	return isFinite(p.X) && isFinite(p.Y) && isFinite(p.Heading) && isFinite(p.Variance)
+}
+
+// coordClose 判断保存的校正后坐标与按记录重放的预期坐标是否在容差内：
+// 误差不超过 1e-9 乘以 1、预期值绝对值、保存值绝对值三者中的最大值。
+// 预期值因溢出成为非有限值时不放行任何保存值（合法校正不会产生非有限
+// 结果，见 correction.go）。
+func coordClose(saved, want float64) bool {
+	scale := math.Max(1, math.Max(math.Abs(saved), math.Abs(want)))
+	return math.Abs(saved-want) <= 1e-9*scale
 }
 
 // canonicalCorrectionHash 计算一次校正请求（锚点时间 + 目标位姿）的
