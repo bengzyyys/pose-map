@@ -495,6 +495,10 @@ func validateLoaded(fd *fileData) error {
 		// 缺少逐帧依据，其贡献已固定在出现的旧观测计数中，不在此统计，
 		// 也不能按帧数猜测。
 		tallies := make(map[string]map[int]int, len(fd.Landmarks))
+		// firstObs 按（路标，出现编号）记录归属该次出现的最早来源观测帧
+		// 时间，供下方首次观测时间核对使用。轨迹时间已保证严格递增，帧按
+		// 时间升序处理，但同帧可能有多条观测，仍按最小值登记。
+		firstObs := make(map[string]map[int]int64, len(fd.Landmarks))
 		for k, src := range fd.Sources {
 			if src == nil {
 				continue // 旧地图帧：无逐帧依据，不要求补齐归属
@@ -515,6 +519,14 @@ func validateLoaded(fd *fileData) error {
 					tallies[ob.ID] = c
 				}
 				c[num]++
+				f := firstObs[ob.ID]
+				if f == nil {
+					f = make(map[int]int64, 1)
+					firstObs[ob.ID] = f
+				}
+				if cur, ok := f[num]; !ok || t < cur {
+					f[num] = t
+				}
 			}
 		}
 		// 每次出现记录的观测次数必须等于归属该次出现的来源观测条数加上
@@ -533,6 +545,28 @@ func validateLoaded(fd *fileData) error {
 			for _, oj := range lm.Occurrences {
 				if got := tallies[lm.ID][oj.Number] + oj.LegacyCount; got != oj.Count {
 					return fmt.Errorf("%w: landmark %s occurrence %d records %d observations but sources and legacy contributions account for %d", ErrCorrupt, lm.ID, oj.Number, oj.Count, got)
+				}
+			}
+		}
+
+		// 首次观测时间核对：首次时间已知且全部观测都有逐帧来源（无固定旧
+		// 贡献）的每次出现，记录的首次观测时间必须准确等于实际归属该次出
+		// 现的最早观测帧时间。写早或写晚都是记录与依据矛盾，按损坏拒绝—
+		// —错误时间即使恰好命中某个已保存的运动帧，只要该帧没有观测这一
+		// 路标也不能接受；没有对应帧时同样拒绝。已失效的历史出现与仍有效
+		// 的出现同样核对；后续帧继续观测或同帧重复观测都不改变最早值。首
+		// 次时间为零或负数是按实际值比较的合法记录，不把零当作未知。含固
+		// 定旧贡献的出现最早观测缺少来源（旧文件第 1 次出现首次时间本就
+		// 未知），不在此核对；旧路标失效后新导入的出现依据完整，仍须通过。
+		// 上方次数核对已保证被核对的每次出现至少有一条来源观测，最早时间
+		// 必然存在。
+		for _, lm := range fd.Landmarks {
+			for _, oj := range lm.Occurrences {
+				if !oj.HasFirstSeen || oj.LegacyCount > 0 {
+					continue
+				}
+				if got, ok := firstObs[lm.ID][oj.Number]; !ok || got != oj.FirstSeenTime {
+					return fmt.Errorf("%w: landmark %s occurrence %d records first seen time %d but its earliest sourced observation is at frame time %d", ErrCorrupt, lm.ID, oj.Number, oj.FirstSeenTime, got)
 				}
 			}
 		}
