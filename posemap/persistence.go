@@ -479,10 +479,28 @@ func validateLoaded(fd *fileData) error {
 	// 都经由它进行。旧文件缺省 sources（解码为 nil）时不构建，这些核对
 	// 都不进行。
 	var replay *observationReplay
+	// cumBySrc 仅在逐帧依据存在时构建：键为来源下标 k（对应帧
+	// trajectory[k+1]），值为从首帧到该帧（两端含）为止按时间边界归属
+	// 各次出现的累计已接纳观测条数快照，只为某条校正记录结束帧所在的下
+	// 标保存。次数核对按各记录自己的结束帧取对应快照，再加该出现保存的
+	// 固定旧贡献（legacyByKey）。
+	var cumBySrc map[int]map[occurrenceKey]int
+	var legacyByKey map[occurrenceKey]int
 	if len(fd.Sources) != 0 {
 		replay = newObservationReplay(fd.Config.MergeDistance)
 		for _, lm := range fd.Landmarks {
 			replay.track(lm.ID, occurrenceWindowsOf(lm))
+		}
+		// 预登记各校正记录结束帧对应的来源下标，只为这些下标保留累计快
+		// 照，避免对每一帧都复制整份计数。
+		cumBySrc = make(map[int]map[occurrenceKey]int, len(fd.Corrections))
+		for _, cr := range fd.Corrections {
+			for j := 1; j < len(fd.Trajectory); j++ {
+				if fd.Trajectory[j].Time == cr.EndTime {
+					cumBySrc[j-1] = nil
+					break
+				}
+			}
 		}
 	}
 	// 校验每条带逐帧依据的观测来源：观测路标必须存在，且所在帧时间必须
@@ -637,6 +655,44 @@ func validateLoaded(fd *fileData) error {
 				if err := checkPosition(lm.ID, oj.Number, oj.X, oj.Y); err != nil {
 					return err
 				}
+			}
+		}
+
+		// “截至每一帧”的累计已接纳观测统计，供逐条校正记录按各自结束时间
+		// 核对次数。同帧对同一标识的多条观测各计一次，无观测帧不增加；
+		// null 旧帧没有逐帧观测，running 不增长——其贡献固定在该出现的
+		// LegacyCount 中，使用时经 legacyByKey 另加，不能按零处理也不能
+		// 按帧数推测。无法归组的观测在上面的归属校验中已被拒绝，这里跳过
+		// 即可。只为校正结束帧所在下标复制快照（已在 cumBySrc 预登记），
+		// 各快照相互独立，后续帧的增长不改写旧快照。
+		running := make(map[occurrenceKey]int)
+		for k, src := range fd.Sources {
+			if src != nil {
+				t := fd.Trajectory[k+1].Time
+				for _, ob := range src.Observations {
+					if num, known := replay.occurrenceOf(ob.ID, t); known && num != 0 {
+						running[occurrenceKey{id: ob.ID, num: num}]++
+					}
+				}
+			}
+			if _, need := cumBySrc[k]; need {
+				snap := make(map[occurrenceKey]int, len(running))
+				for key, c := range running {
+					snap[key] = c
+				}
+				cumBySrc[k] = snap
+			}
+		}
+		// 各次出现保存的固定旧观测贡献次数（旧地图缺少逐帧依据的既有观
+		// 测），作为所属出现的既有贡献计入截至记录结束时间的总数。
+		legacyByKey = make(map[occurrenceKey]int, len(fd.Landmarks))
+		for _, lm := range fd.Landmarks {
+			if len(lm.Occurrences) == 0 {
+				legacyByKey[occurrenceKey{id: lm.ID, num: 1}] = lm.LegacyCount
+				continue
+			}
+			for _, oj := range lm.Occurrences {
+				legacyByKey[occurrenceKey{id: lm.ID, num: oj.Number}] = oj.LegacyCount
 			}
 		}
 	}
@@ -827,6 +883,36 @@ func validateLoaded(fd *fileData) error {
 			for key := range got {
 				if _, ok := want[key]; !ok {
 					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d with no observation in its range", ErrCorrupt, cr.ID, key.id, key.num)
+				}
+			}
+
+			// 观测次数核对：回环校正只移动轨迹、不增删已接受观测，因此对
+			// 于依据完整的记录，其每个受影响路标出现的校正前、校正后次数
+			// 都必须等于截至“本记录结束时间”已经接纳、归属该次出现的观
+			// 测总数。这个总数按各记录自己的结束帧从累计快照截取：包含锚
+			// 点之前属于同一次出现的观测与结束帧上的观测，不只是被移动的
+			// [anchor,end] 那段；同帧多条观测各计一次，无观测帧不增加；
+			// 该出现保存的固定旧观测贡献（旧地图既有观测）也要计入，不能
+			// 当作零。结束帧之后才接纳的观测（例如记录结束于 300、后来在
+			// 400 又观测一次）不属于本记录；后来对重叠范围的再次校正不改
+			// 变判断——每条记录都以自己的结束时间为准。各次出现分别核
+			// 对，不能借另一出现的观测补足；已失效的旧出现只要被该条校正
+			// 涉及同样核对。校正前或校正后任一次数不符，即使路标列表、位
+			// 置与文件校验都正常，也按损坏拒绝整份地图。省略出现编号的旧
+			// 条目沿用按第 1 次出现解释的规则。范围内含 null 旧帧时依据不
+			// 完整，保留旧文件的既有打开规则（fullyBased 为假，不到此）。
+			snapshot := cumBySrc[endIdx-1]
+			for _, lc := range cr.Landmarks {
+				num := lc.Occurrence
+				if num == 0 {
+					num = 1
+				}
+				wantCount := snapshot[occurrenceKey{id: lc.ID, num: num}] + legacyByKey[occurrenceKey{id: lc.ID, num: num}]
+				if lc.Before.Count != wantCount {
+					return fmt.Errorf("%w: correction %s landmark %s occurrence %d records %d pre-correction observations but %d were accepted by its end time %d", ErrCorrupt, cr.ID, lc.ID, num, lc.Before.Count, wantCount, cr.EndTime)
+				}
+				if lc.After.Count != wantCount {
+					return fmt.Errorf("%w: correction %s landmark %s occurrence %d records %d post-correction observations but %d were accepted by its end time %d", ErrCorrupt, cr.ID, lc.ID, num, lc.After.Count, wantCount, cr.EndTime)
 				}
 			}
 		}
