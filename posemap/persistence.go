@@ -586,47 +586,50 @@ func validateLoaded(fd *fileData) error {
 		// 距离只是导入/校正时的接纳门槛，不是保存位置偏差的容许范围：重放
 		// 中出现非有限结果或距离冲突，或最终平均位置与保存位置不完全一致，
 		// 都按损坏拒绝。纯旧文件没有 sources、null 旧帧没有依据，均不重放。
-		type posKey struct {
-			id  string
-			num int
-		}
-		posAggs := make(map[posKey]*observationAgg, len(fd.Landmarks))
-		seedPosAgg := func(id string, num, legacyCount int, lx, ly float64) {
-			a := &observationAgg{}
-			if legacyCount > 0 {
-				a.seed(legacyCount, lx, ly)
+		// 先为每次出现（含旧版平铺路标即第 1 次出现）登记固定起点；没有固
+		// 定旧贡献的出现起点为空，其位置完全由来源观测重建。
+		posSeeds := make(map[occurrenceKey]occurrenceSeed, len(fd.Landmarks))
+		addSeed := func(id string, num, legacyCount int, lx, ly float64) {
+			posSeeds[occurrenceKey{id: id, num: num}] = occurrenceSeed{
+				fixedCount: legacyCount, fixedX: lx, fixedY: ly,
 			}
-			posAggs[posKey{id: id, num: num}] = a
 		}
 		for _, lm := range fd.Landmarks {
 			if len(lm.Occurrences) == 0 {
-				// 旧版平铺路标即第 1 次出现。
-				seedPosAgg(lm.ID, 1, lm.LegacyCount, lm.LegacyMX, lm.LegacyMY)
+				addSeed(lm.ID, 1, lm.LegacyCount, lm.LegacyMX, lm.LegacyMY)
 				continue
 			}
 			for _, oj := range lm.Occurrences {
-				seedPosAgg(lm.ID, oj.Number, oj.LegacyCount, oj.LegacyMX, oj.LegacyMY)
+				addSeed(lm.ID, oj.Number, oj.LegacyCount, oj.LegacyMX, oj.LegacyMY)
 			}
 		}
+		posFrames := make([]replayFrame, 0, len(fd.Sources))
 		for k, src := range fd.Sources {
 			if src == nil {
-				continue // 旧地图帧：无逐帧依据，其贡献固定在旧贡献起点中
+				// 旧文件帧：无逐帧依据，不列入重放，其贡献固定在对应出现的
+				// 旧贡献起点中。
+				continue
 			}
-			pose := fd.Trajectory[k+1]
-			for _, ob := range src.Observations {
-				// 归属（存在性与时间边界）已在上面校验，num 必非 0。
-				num := occurrenceNumberAt(bounds[ob.ID], pose.Time)
-				a := posAggs[posKey{id: ob.ID, num: num}]
-				switch a.admit(pose, ob, fd.Config.MergeDistance) {
-				case obsNonFinite:
-					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d is non-finite", ErrCorrupt, ob.ID, num, pose.Time)
-				case obsConflict:
-					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d violates merge distance", ErrCorrupt, ob.ID, num, pose.Time)
-				}
+			posFrames = append(posFrames, replayFrame{pose: fd.Trajectory[k+1], hasBasis: true, observations: src.Observations})
+		}
+		owner := func(id string, t int64) int {
+			return occurrenceNumberAt(bounds[id], t)
+		}
+		posResults, perr, preason := replayObservations(posFrames, owner, posSeeds, fd.Config.MergeDistance)
+		if perr != nil {
+			// 归属（存在性与时间边界）已在上面的来源校验中确认，perr 只可能
+			// 来自接纳规则本身：非有限优先于距离冲突。
+			if preason == obsNonFinite {
+				return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d is non-finite", ErrCorrupt, perr.landmarkID, perr.occurrence, perr.frameTime)
 			}
+			return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d violates merge distance", ErrCorrupt, perr.landmarkID, perr.occurrence, perr.frameTime)
+		}
+		posByKey := make(map[occurrenceKey]replayResult, len(posResults))
+		for _, r := range posResults {
+			posByKey[r.key] = r
 		}
 		checkPosition := func(id string, num int, x, y float64) error {
-			a := posAggs[posKey{id: id, num: num}]
+			a := posByKey[occurrenceKey{id: id, num: num}]
 			// 次数核对已保证 a.count 与记录次数一致（含旧贡献起点），这里只
 			// 核对位置：保存位置必须与按依据重放出的等权平均完全一致。
 			if a.x != x || a.y != y {
@@ -659,11 +662,6 @@ func validateLoaded(fd *fileData) error {
 		segIDs[sg.ID] = struct{}{}
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
-	// corrOccKey 标识校正范围内被观测涉及的某个路标某一次出现。
-	type corrOccKey struct {
-		id  string
-		num int
-	}
 	for _, cr := range fd.Corrections {
 		if cr.ID == "" || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
@@ -812,16 +810,16 @@ func validateLoaded(fd *fileData) error {
 		// 含 null 旧帧的校正缺少逐帧依据，保留旧地图的既有打开规则，不凭
 		// 推测要求补造观测。
 		if bounds != nil && fullyBased {
-			want := make(map[corrOccKey]struct{})
+			want := make(map[occurrenceKey]struct{})
 			for j := anchorIdx; j <= endIdx; j++ {
 				t := fd.Trajectory[j].Time
 				for _, ob := range fd.Sources[j-1].Observations {
 					// 归属已在上方的来源校验中确认（路标存在、必有唯一
 					// 接纳出现），这里同样计算以保持两处规则一致。
-					want[corrOccKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
+					want[occurrenceKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
 				}
 			}
-			got := make(map[corrOccKey]struct{}, len(cr.Landmarks))
+			got := make(map[occurrenceKey]struct{}, len(cr.Landmarks))
 			for _, lc := range cr.Landmarks {
 				num := lc.Occurrence
 				if num == 0 {
@@ -831,7 +829,7 @@ func validateLoaded(fd *fileData) error {
 				if !ok || num < 1 || num > len(wins) {
 					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d not touched by its range", ErrCorrupt, cr.ID, lc.ID, num)
 				}
-				key := corrOccKey{id: lc.ID, num: num}
+				key := occurrenceKey{id: lc.ID, num: num}
 				if _, dup := got[key]; dup {
 					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
 				}

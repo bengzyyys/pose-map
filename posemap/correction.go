@@ -151,24 +151,17 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		next[j] = np
 	}
 
-	// occKey 标识某一路标的某一次出现。回环校正跨越同一路标的多次出现
-	// 时，各次出现分别聚合、分别遵守合并距离限制。观测按所在帧时间归入
-	// 当时的那次出现，时间边界规则与打开文件时的归属校验共享（见
-	// occurrence.go）；已接受观测必然属于某次出现。
-	type occKey struct {
-		id  string
-		num int
-	}
-
-	// 受影响的路标出现：在受影响帧中被观测到的全部（标识，出现编号）。
-	affected := make(map[occKey]struct{})
+	// 受影响的路标出现：在受影响帧（锚点到末帧，两端包含）中被观测到的
+	// 全部（标识，出现编号）。只有这些出现会更新位置并进入校正记录；更早
+	// 帧中的观测即使同属一个路标，也作为固定旧贡献保留原位姿下的位置。
+	affected := make(map[occurrenceKey]struct{})
 	for j := anchorIdx; j <= end; j++ {
 		t := st.trajectory[j].Time
 		for _, ob := range st.sources[j-1].observations {
-			affected[occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceAt(t)}] = struct{}{}
+			affected[occurrenceKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceAt(t)}] = struct{}{}
 		}
 	}
-	affectedKeys := make([]occKey, 0, len(affected))
+	affectedKeys := make([]occurrenceKey, 0, len(affected))
 	for k := range affected {
 		affectedKeys = append(affectedKeys, k)
 	}
@@ -179,71 +172,81 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 		return affectedKeys[i].num < affectedKeys[j].num
 	})
 
-	// 逐“出现”运行聚合：旧文件第 1 次出现的既有观测作为固定“旧贡献”
-	// 起点（位置不随校正改变），其余观测按帧时间与同帧输入次序、以当前/
-	// 校正后位姿重放，接纳与合并规则（转换、非有限优先、首条建点、距离
-	// 判定、增量平均、计数）与导入共享同一实现（见 aggregate.go）。同一路
-	// 标的不同出现互不参与彼此的合并。
-	aggs := make(map[occKey]*observationAgg, len(affectedKeys))
-	for _, k := range affectedKeys {
-		occ := st.landmarks[k.id].appearances[k.num-1]
-		a := &observationAgg{}
-		if occ.legacyCount > 0 {
-			// 旧文件第 1 次出现：固定旧贡献作为聚合起点，不随后续校正改变。
-			a.seed(occ.legacyCount, occ.legacyMX, occ.legacyMY)
-		}
-		aggs[k] = a
-	}
+	// 位置重放与打开地图时的位置核对共用同一份流程（见 replay.go）：对从
+	// 第一帧到末帧的全部逐帧观测，按帧时间与同帧输入次序归入当时的那次
+	// 出现逐条接纳。锚点之前的帧使用校正前位姿（其观测因此固定为原位置），
+	// 锚点及之后使用上面推演出的校正后位姿；旧文件帧没有逐帧依据（src 为
+	// nil，重放中跳过），其观测作为对应出现的固定旧贡献起点（legacyCount
+	// 次平均），不补造观测。同一路标的不同出现分别重放、分别遵守合并距
+	// 离，旧出现不参与新出现的合并。
+	replayFrames := make([]replayFrame, 0, end)
 	for j := 1; j <= end; j++ {
 		src := st.sources[j-1]
 		if src == nil {
-			continue // 旧文件帧：观测已计入对应出现的 legacy 起点
+			continue // 旧文件帧：无逐帧依据，其贡献固定在对应出现的旧起点中
 		}
 		pose := next[j]
-		t := st.trajectory[j].Time
-		for _, ob := range src.observations {
-			k := occKey{id: ob.ID, num: st.landmarks[ob.ID].occurrenceAt(t)}
-			a, ok := aggs[k]
-			if !ok {
-				continue
-			}
-			// 目标、原始观测与校正后位姿都有限，转换结果仍可能因数值过大
-			// 溢出为 NaN/无穷。与导入一致：数值异常优先于距离冲突，按
-			// non_finite 拒绝并指出该观测所在帧的实际时间、路标标识与
-			// 其所属的出现编号（不是锚点时间），无论该次出现此前是否已有
-			// 观测、记录仍有效还是已失效。
-			switch a.admit(pose, ob, st.config.MergeDistance) {
-			case obsNonFinite:
-				return CorrectionRecord{}, &RejectError{
-					Kind:          RejectNonFinite,
-					Time:          st.trajectory[j].Time,
-					HasTime:       true,
-					Landmark:      ob.ID,
-					HasLandmark:   true,
-					Occurrence:    k.num,
-					HasOccurrence: true,
-				}
-			case obsConflict:
-				return CorrectionRecord{}, &RejectError{
-					Kind:          RejectLandmarkConflict,
-					Time:          st.trajectory[j].Time,
-					HasTime:       true,
-					Landmark:      ob.ID,
-					HasLandmark:   true,
-					Occurrence:    k.num,
-					HasOccurrence: true,
+		if j < anchorIdx {
+			pose = st.trajectory[j] // 锚点之前：校正前位姿，观测位置固定
+		}
+		replayFrames = append(replayFrames, replayFrame{pose: pose, hasBasis: true, observations: src.observations})
+	}
+	seeds := make(map[occurrenceKey]occurrenceSeed)
+	for id, lm := range st.landmarks {
+		for i, occ := range lm.appearances {
+			if occ.legacyCount > 0 {
+				seeds[occurrenceKey{id: id, num: i + 1}] = occurrenceSeed{
+					fixedCount: occ.legacyCount, fixedX: occ.legacyMX, fixedY: occ.legacyMY,
 				}
 			}
 		}
 	}
+	owner := func(id string, t int64) int {
+		lm := st.landmarks[id]
+		if lm == nil {
+			return 0
+		}
+		return lm.occurrenceAt(t)
+	}
+	results, rerr, reason := replayObservations(replayFrames, owner, seeds, st.config.MergeDistance)
+	if rerr != nil {
+		if rerr.occurrence == 0 {
+			// 已接受观测必然属于某次出现；归属不到任何出现只能是内存不变量
+			// 被破坏，按损坏处理而非半提交。
+			return CorrectionRecord{}, ErrCorrupt
+		}
+		kind := RejectNonFinite
+		if reason == obsConflict {
+			kind = RejectLandmarkConflict
+		}
+		// 目标、原始观测与校正后位姿都有限，转换结果仍可能因数值过大溢出
+		// 为 NaN/无穷。与导入一致：数值异常优先于距离冲突，按实际出错原因
+		// 拒绝并指出该观测所在帧的实际时间、路标标识与其所属的出现编号
+		// （不是锚点时间），无论该次出现此前是否已有观测、记录仍有效还是
+		// 已失效。
+		return CorrectionRecord{}, &RejectError{
+			Kind:          kind,
+			Time:          rerr.frameTime,
+			HasTime:       true,
+			Landmark:      rerr.landmarkID,
+			HasLandmark:   true,
+			Occurrence:    rerr.occurrence,
+			HasOccurrence: true,
+		}
+	}
+	replayByKey := make(map[occurrenceKey]replayResult, len(results))
+	for _, r := range results {
+		replayByKey[r.key] = r
+	}
 	for _, k := range affectedKeys {
-		a := aggs[k]
 		occ := st.landmarks[k.id].appearances[k.num-1]
-		if !isFinite(a.x) || !isFinite(a.y) {
+		r := replayByKey[k]
+		if !isFinite(r.x) || !isFinite(r.y) {
 			return CorrectionRecord{}, &RejectError{Kind: RejectNonFinite, Time: req.Anchor, HasTime: true}
 		}
-		if a.count != occ.count {
-			// 内存不变量被破坏不可能由本包写出，按损坏处理而非半提交。
+		if r.count != occ.count {
+			// 重放只改位置不改已接受观测次数；不一致不可能由本包写出，按
+			// 损坏处理而非半提交。
 			return CorrectionRecord{}, ErrCorrupt
 		}
 	}
@@ -262,19 +265,19 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 	}
 	for _, k := range affectedKeys {
 		occ := st.landmarks[k.id].appearances[k.num-1]
-		a := aggs[k]
+		r := replayByKey[k]
 		rec.Landmarks = append(rec.Landmarks, LandmarkChange{
 			ID:         k.id,
 			Occurrence: k.num,
 			Before:     Landmark{ID: k.id, X: occ.x, Y: occ.y, Count: occ.count},
-			After:      Landmark{ID: k.id, X: a.x, Y: a.y, Count: a.count},
+			After:      Landmark{ID: k.id, X: r.x, Y: r.y, Count: r.count},
 		})
 	}
 
 	// ---- 全部校验通过：暂存提交并落盘；落盘失败精确回滚 ----
 	oldTraj := append([]Pose(nil), st.trajectory...)
 	type occSnapshot struct {
-		key  occKey
+		key  occurrenceKey
 		occ  *occurrenceState
 		x, y float64
 	}
@@ -287,8 +290,8 @@ func (m *Map) Correct(req Correction) (CorrectionRecord, error) {
 
 	st.trajectory = next
 	for _, s := range oldOcc {
-		a := aggs[s.key]
-		s.occ.x, s.occ.y = a.x, a.y
+		r := replayByKey[s.key]
+		s.occ.x, s.occ.y = r.x, r.y
 	}
 	st.corrections = append(st.corrections, rec)
 	st.corrIndex[req.ID] = canonicalCorrectionHash(req.Anchor, tgt)
