@@ -493,8 +493,10 @@ func validateLoaded(fd *fileData) error {
 		// 归属校验的同时按（路标，出现编号）统计来源观测条数：每条观测
 		// 各算一次，同帧重复观测同一标识不去重，空观测帧不计。null 帧
 		// 缺少逐帧依据，其贡献已固定在出现的旧观测计数中，不在此统计，
-		// 也不能按帧数猜测。
+		// 也不能按帧数猜测。同时记录归属各次出现的最早来源观测帧时间，
+		// 供下方首次观测时间核对使用。
 		tallies := make(map[string]map[int]int, len(fd.Landmarks))
+		firstObs := make(map[string]map[int]int64, len(fd.Landmarks))
 		for k, src := range fd.Sources {
 			if src == nil {
 				continue // 旧地图帧：无逐帧依据，不要求补齐归属
@@ -515,6 +517,14 @@ func validateLoaded(fd *fileData) error {
 					tallies[ob.ID] = c
 				}
 				c[num]++
+				f := firstObs[ob.ID]
+				if f == nil {
+					f = make(map[int]int64, 1)
+					firstObs[ob.ID] = f
+				}
+				if cur, ok := f[num]; !ok || t < cur {
+					f[num] = t
+				}
 			}
 		}
 		// 每次出现记录的观测次数必须等于归属该次出现的来源观测条数加上
@@ -533,6 +543,33 @@ func validateLoaded(fd *fileData) error {
 			for _, oj := range lm.Occurrences {
 				if got := tallies[lm.ID][oj.Number] + oj.LegacyCount; got != oj.Count {
 					return fmt.Errorf("%w: landmark %s occurrence %d records %d observations but sources and legacy contributions account for %d", ErrCorrupt, lm.ID, oj.Number, oj.Count, got)
+				}
+			}
+		}
+
+		// 首次观测时间核对：首次观测时间已知、且全部观测都具有逐帧来源
+		// （无固定旧贡献）的每次出现，记录的首次时间必须准确等于实际归属
+		// 该次出现的最早来源观测帧时间。写早或写晚都是损坏：错误时间即使
+		// 恰好命中某个已保存的帧，只要该帧没有观测这一路标也不能接受；
+		// 错误时间没有对应帧同样拒绝。各次出现分别核对——已失效的旧出现
+		// 与失效后再现的新出现各自依据自己的观测判断，不能互相代替；后续
+		// 帧继续观测或同帧重复观测都不改变首次时间。时间为零或负数是合法
+		// 帧时间，按实际值比较，不把零当作时间未知。旧文件第 1 次出现缺
+		// 少旧观测依据、首次时间未知（HasFirstSeen 为假），或仍含固定旧
+		// 贡献时，其最早观测无从核对，保留旧地图的既有打开规则；但旧路标
+		// 失效后新导入产生的出现依据完整、首次时间已知，不因同一文件存在
+		// 旧历史而跳过核对。回环校正只改位姿与位置，不改观测帧时间，已正
+		// 确保存的校正地图仍满足此不变量。
+		for _, lm := range fd.Landmarks {
+			for _, oj := range lm.Occurrences {
+				if !oj.HasFirstSeen || oj.LegacyCount > 0 {
+					continue
+				}
+				// 次数核对已保证 Count-LegacyCount 条来源观测存在，最早
+				// 帧时间必然已记录；缺失本身即矛盾。
+				first, ok := firstObs[lm.ID][oj.Number]
+				if !ok || first != oj.FirstSeenTime {
+					return fmt.Errorf("%w: landmark %s occurrence %d records first seen time %d but its earliest sourced observation is at frame time %d", ErrCorrupt, lm.ID, oj.Number, oj.FirstSeenTime, first)
 				}
 			}
 		}
