@@ -473,14 +473,16 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: multiple active occurrences for landmark %s", ErrCorrupt, lm.ID)
 		}
 	}
-	// 各路标历次出现的时间边界：来源帧的观测归属核对与校正记录路标列表
-	// 核对共用同一份边界、同一套归属规则（见 occurrence.go）。旧文件缺省
-	// sources（解码为 nil）时不构建，两处核对都不进行。
-	var bounds map[string][]occurrenceWindow
+	// 观测重放器：各路标历次出现的时间边界（归属规则见 occurrence.go）
+	// 与逐条重建位置的流程（见 replay.go）和回环校正共享同一实现；来源
+	// 帧的归属核对、次数/首次时间统计、位置核对与校正记录路标列表核对
+	// 都经由它进行。旧文件缺省 sources（解码为 nil）时不构建，这些核对
+	// 都不进行。
+	var replay *observationReplay
 	if len(fd.Sources) != 0 {
-		bounds = make(map[string][]occurrenceWindow, len(fd.Landmarks))
+		replay = newObservationReplay(fd.Config.MergeDistance)
 		for _, lm := range fd.Landmarks {
-			bounds[lm.ID] = occurrenceWindowsOf(lm)
+			replay.track(lm.ID, occurrenceWindowsOf(lm))
 		}
 	}
 	// 校验每条带逐帧依据的观测来源：观测路标必须存在，且所在帧时间必须
@@ -503,11 +505,10 @@ func validateLoaded(fd *fileData) error {
 			}
 			t := fd.Trajectory[k+1].Time
 			for _, ob := range src.Observations {
-				wins, ok := bounds[ob.ID]
-				if !ok {
+				num, known := replay.occurrenceOf(ob.ID, t)
+				if !known {
 					return fmt.Errorf("%w: observation of unknown landmark %s at frame time %d", ErrCorrupt, ob.ID, t)
 				}
-				num := occurrenceNumberAt(wins, t)
 				if num == 0 {
 					return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, ob.ID, t)
 				}
@@ -578,55 +579,46 @@ func validateLoaded(fd *fileData) error {
 		// 位置确实是这些观测依据当前保存位姿重放后的等权平均。每条来源观测
 		// 按所在帧当前保存的位姿转换到地图坐标，按帧时间升序、同帧按输入
 		// 次序，归入各自出现分别重放；同帧对同一标识的多条观测各自参与，
-		// 空观测帧不增加贡献。转换、接纳、增量平均与计数全部复用导入/校正
-		// 的同一规则（见 aggregate.go），旧文件固定旧贡献（LegacyCount 次
-		// 平均）作为聚合起点——不能当成零，也不能用缺少依据的帧数代替。
-		// 回环校正后保存的文件按当前轨迹重放即得到当前位置，不要求等于校正
-		// 记录里的历史快照；各次出现分别核对，已失效的出现同样核对。合并
-		// 距离只是导入/校正时的接纳门槛，不是保存位置偏差的容许范围：重放
-		// 中出现非有限结果或距离冲突，或最终平均位置与保存位置不完全一致，
-		// 都按损坏拒绝。纯旧文件没有 sources、null 旧帧没有依据，均不重放。
-		type posKey struct {
-			id  string
-			num int
-		}
-		posAggs := make(map[posKey]*observationAgg, len(fd.Landmarks))
-		seedPosAgg := func(id string, num, legacyCount int, lx, ly float64) {
-			a := &observationAgg{}
-			if legacyCount > 0 {
-				a.seed(legacyCount, lx, ly)
-			}
-			posAggs[posKey{id: id, num: num}] = a
-		}
+		// 空观测帧不增加贡献。归组、固定旧贡献起点与逐条重建全部经由与
+		// 回环校正共享的重放器（见 replay.go，单条接纳规则见 aggregate.go），
+		// 旧文件固定旧贡献（LegacyCount 次平均）作为聚合起点——不能当成零，
+		// 也不能用缺少依据的帧数代替。回环校正后保存的文件按当前轨迹重放
+		// 即得到当前位置，不要求等于校正记录里的历史快照；各次出现分别核
+		// 对，已失效的出现同样核对。合并距离只是导入/校正时的接纳门槛，不
+		// 是保存位置偏差的容许范围：重放中出现非有限结果或距离冲突，或最
+		// 终平均位置与保存位置不完全一致，都按损坏拒绝。纯旧文件没有
+		// sources、null 旧帧没有依据，均不重放。
 		for _, lm := range fd.Landmarks {
 			if len(lm.Occurrences) == 0 {
 				// 旧版平铺路标即第 1 次出现。
-				seedPosAgg(lm.ID, 1, lm.LegacyCount, lm.LegacyMX, lm.LegacyMY)
+				replay.seed(lm.ID, 1, lm.LegacyCount, lm.LegacyMX, lm.LegacyMY)
 				continue
 			}
 			for _, oj := range lm.Occurrences {
-				seedPosAgg(lm.ID, oj.Number, oj.LegacyCount, oj.LegacyMX, oj.LegacyMY)
+				replay.seed(lm.ID, oj.Number, oj.LegacyCount, oj.LegacyMX, oj.LegacyMY)
 			}
 		}
+		frames := make([]replayFrame, 0, len(fd.Sources))
 		for k, src := range fd.Sources {
 			if src == nil {
 				continue // 旧地图帧：无逐帧依据，其贡献固定在旧贡献起点中
 			}
 			pose := fd.Trajectory[k+1]
-			for _, ob := range src.Observations {
-				// 归属（存在性与时间边界）已在上面校验，num 必非 0。
-				num := occurrenceNumberAt(bounds[ob.ID], pose.Time)
-				a := posAggs[posKey{id: ob.ID, num: num}]
-				switch a.admit(pose, ob, fd.Config.MergeDistance) {
-				case obsNonFinite:
-					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d is non-finite", ErrCorrupt, ob.ID, num, pose.Time)
-				case obsConflict:
-					return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d violates merge distance", ErrCorrupt, ob.ID, num, pose.Time)
-				}
+			frames = append(frames, replayFrame{time: pose.Time, pose: pose, observations: src.Observations})
+		}
+		if rej := replay.replay(frames); rej != nil {
+			switch rej.reason {
+			case replayNonFinite:
+				return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d is non-finite", ErrCorrupt, rej.id, rej.num, rej.time)
+			case replayConflict:
+				return fmt.Errorf("%w: replayed observation of landmark %s occurrence %d at frame time %d violates merge distance", ErrCorrupt, rej.id, rej.num, rej.time)
+			default:
+				// 归属（存在性与时间边界）已在上面校验，不会无法归组。
+				return fmt.Errorf("%w: observation of landmark %s at frame time %d belongs to no occurrence", ErrCorrupt, rej.id, rej.time)
 			}
 		}
 		checkPosition := func(id string, num int, x, y float64) error {
-			a := posAggs[posKey{id: id, num: num}]
+			a := replay.agg(id, num)
 			// 次数核对已保证 a.count 与记录次数一致（含旧贡献起点），这里只
 			// 核对位置：保存位置必须与按依据重放出的等权平均完全一致。
 			if a.x != x || a.y != y {
@@ -659,11 +651,6 @@ func validateLoaded(fd *fileData) error {
 		segIDs[sg.ID] = struct{}{}
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
-	// corrOccKey 标识校正范围内被观测涉及的某个路标某一次出现。
-	type corrOccKey struct {
-		id  string
-		num int
-	}
 	for _, cr := range fd.Corrections {
 		if cr.ID == "" || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
@@ -704,9 +691,9 @@ func validateLoaded(fd *fileData) error {
 		}
 		// 以下两项核对都只针对范围内逐帧依据完整的校正：范围内任一来源
 		// 帧为 null 旧帧时保留旧文件的既有打开规则，不推测运动方差、也
-		// 不把未知贡献当成零；纯旧文件缺省 sources（长度为 0，bounds 同
-		// 时为 nil）时所有记录都不核对。同一文件中其余依据完整的记录不
-		// 受含旧帧记录影响，仍逐一核对。
+		// 不把未知贡献当成零；纯旧文件缺省 sources（长度为 0，重放器不构
+		// 建）时所有记录都不核对。同一文件的其余依据完整的记录不受含旧帧
+		// 记录影响，仍逐一核对。
 		fullyBased := len(fd.Sources) != 0
 		if fullyBased {
 			for k := anchorIdx - 1; k <= endIdx-1; k++ {
@@ -803,35 +790,30 @@ func validateLoaded(fd *fileData) error {
 		// 到的每个（路标，出现编号）必须恰好有一条前后记录，同一次出现被
 		// 多帧或同帧多条观测涉及也只记一条；少记、多记、重复、或把出现
 		// 编号改指该范围没有涉及的另一出现，都按损坏拒绝整份文件，而不是
-		// 只看条目里的坐标与次数是否合法。归属沿用与来源校验相同的时间边
-		// 界规则：同一标识失效后再现属于不同出现，即使位置相同也分别对应；
-		// 已失效的旧出现只要范围内（含失效时刻）有它的观测就必须在列表
-		// 中，不因当前区域查询不再返回它而被排除；范围外帧（如记录之后
-		// 才再现的新出现）的观测不计入。范围内没有任何路标观测时列表必须
-		// 为空，非空即损坏。仅对范围内逐帧依据完整的校正做此核对：范围内
-		// 含 null 旧帧的校正缺少逐帧依据，保留旧地图的既有打开规则，不凭
-		// 推测要求补造观测。
-		if bounds != nil && fullyBased {
-			want := make(map[corrOccKey]struct{})
+		// 只看条目里的坐标与次数是否合法。归组沿用与回环校正相同的时间边
+		// 界规则（重放器，见 replay.go）：同一标识失效后再现属于不同出现，
+		// 即使位置相同也分别对应；已失效的旧出现只要范围内（含失效时刻）
+		// 有它的观测就必须在列表中，不因当前区域查询不再返回它而被排除；
+		// 范围外帧（如记录之后才再现的新出现）的观测不计入。范围内没有
+		// 任何路标观测时列表必须为空，非空即损坏。仅对范围内逐帧依据完整
+		// 的校正做此核对：范围内含 null 旧帧的校正缺少逐帧依据，保留旧地
+		// 图的既有打开规则，不凭推测要求补造观测。
+		if replay != nil && fullyBased {
+			rangeFrames := make([]replayFrame, 0, endIdx-anchorIdx+1)
 			for j := anchorIdx; j <= endIdx; j++ {
-				t := fd.Trajectory[j].Time
-				for _, ob := range fd.Sources[j-1].Observations {
-					// 归属已在上方的来源校验中确认（路标存在、必有唯一
-					// 接纳出现），这里同样计算以保持两处规则一致。
-					want[corrOccKey{id: ob.ID, num: occurrenceNumberAt(bounds[ob.ID], t)}] = struct{}{}
-				}
+				rangeFrames = append(rangeFrames, replayFrame{time: fd.Trajectory[j].Time, observations: fd.Sources[j-1].Observations})
 			}
-			got := make(map[corrOccKey]struct{}, len(cr.Landmarks))
+			want := replay.observed(rangeFrames)
+			got := make(map[occurrenceKey]struct{}, len(cr.Landmarks))
 			for _, lc := range cr.Landmarks {
 				num := lc.Occurrence
 				if num == 0 {
 					num = 1 // 更早版本写出的校正记录不带编号，按第 1 次出现解释
 				}
-				wins, ok := bounds[lc.ID]
-				if !ok || num < 1 || num > len(wins) {
+				if num < 1 || num > replay.occurrences(lc.ID) {
 					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d not touched by its range", ErrCorrupt, cr.ID, lc.ID, num)
 				}
-				key := corrOccKey{id: lc.ID, num: num}
+				key := occurrenceKey{id: lc.ID, num: num}
 				if _, dup := got[key]; dup {
 					return fmt.Errorf("%w: correction %s lists landmark %s occurrence %d more than once", ErrCorrupt, cr.ID, lc.ID, num)
 				}

@@ -1,8 +1,8 @@
 package posemap
 
 // occurrence.go 承载“观测按所在帧时间归入当时那次出现”这一业务规则，
-// 供打开地图文件时的归属校验（validateLoaded）与回环校正时的出现归组
-// （Correct）共同使用，保证两处对时间边界的判断始终一致。
+// 供观测重放器（observationReplay，见 replay.go）归组使用；提交回环校正
+// 与打开地图时的核对都经由重放器共享这同一份时间边界判断，两处始终一致。
 
 // occurrenceWindow 是一次出现接纳观测的时间边界：
 //
@@ -56,19 +56,18 @@ func (o *occurrenceState) window() occurrenceWindow {
 	}
 }
 
-// occurrenceAt 把时间 t 的观测归入该路标当时的那次出现，返回 1 起的
-// 出现编号；不属于任何出现时返回 0。
-func (lm *landmarkState) occurrenceAt(t int64) int {
-	for i, o := range lm.appearances {
-		if o.window().owns(t) {
-			return i + 1
-		}
+// occurrenceWindows 返回该路标各次出现的时间边界（编号即下标+1），供
+// 重放器登记归属边界使用。
+func (lm *landmarkState) occurrenceWindows() []occurrenceWindow {
+	wins := make([]occurrenceWindow, 0, len(lm.appearances))
+	for _, o := range lm.appearances {
+		wins = append(wins, o.window())
 	}
-	return 0
+	return wins
 }
 
 // occurrenceWindowsOf 从文件记录中提取一个路标各次出现的时间边界，供
-// 打开文件时的观测归属校验使用。旧版平铺路标视为一次首次观测时间未知、
+// 打开文件时登记重放器的归属边界使用。旧版平铺路标视为一次首次观测时间未知、
 // 仍有效的第 1 次出现（无下界、无上界）。
 func occurrenceWindowsOf(lm landmarkJSON) []occurrenceWindow {
 	if len(lm.Occurrences) == 0 {
