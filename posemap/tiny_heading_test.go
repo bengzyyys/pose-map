@@ -307,3 +307,128 @@ func TestTinyHeadingCorrectionAcrossPiBoundary(t *testing.T) {
 		t.Fatalf("heading %v outside [-pi, pi)", h)
 	}
 }
+
+// 锚点朝向为 1 弧度、目标朝向为 ±1e-20 弧度的校正：目标与锚点朝向的差
+// 不可表示（舍入成 -1），但目标本身是有限且可表示的真实定位结果，必须作
+// 为锚点校正后朝向保留下来，不能因比原朝向小很多就变成零。原本与锚点朝
+// 向完全相同的帧得到同一目标朝向，其他朝向差的帧保留相对方向；受影响路
+// 标观测带上同一非零横向分量；末帧的小朝向继续参与随后导入；重开后一致。
+func TestTinyTargetHeadingSurvivesCorrection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target float64
+	}{
+		{"positive", 1e-20},
+		{"negative", -1e-20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "map.pose")
+			m, err := Create(path, Config{InitialTime: 0, MaxInterval: 1000, MergeDistance: 1})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			// 全部帧位于原点：t=10 锚点转向 1 弧度并在自身正前方 (1,0) 观测 L，
+			// t=20 转向相反的 0.5（与锚点朝向不同），t=30 转回与锚点完全相同的朝向。
+			if _, err := m.ImportSegment(Segment{ID: "s", Frames: []Frame{
+				{Time: 10, DHeading: 1, Observations: []Observation{{ID: "L", X: 1, Y: 0}}},
+				{Time: 20, DHeading: 0.5},
+				{Time: 30, DHeading: -0.5},
+			}}); err != nil {
+				t.Fatalf("ImportSegment: %v", err)
+			}
+			rec, err := m.Correct(Correction{
+				ID:     "c",
+				Anchor: 10,
+				Target: CorrectionTarget{X: 0, Y: 0, Heading: tc.target, Variance: 0},
+			})
+			if err != nil {
+				t.Fatalf("Correct: %v", err)
+			}
+			if len(rec.Poses) != 3 {
+				t.Fatalf("pose changes = %d, want 3", len(rec.Poses))
+			}
+			// 锚点：精确采用归一后的目标朝向（已在 [-π,π) 内，保留数值与正负）。
+			if rec.Poses[0].After.Heading != tc.target {
+				t.Fatalf("anchor heading = %v, want %v", rec.Poses[0].After.Heading, tc.target)
+			}
+			if rec.Poses[0].After.X != 0 || rec.Poses[0].After.Y != 0 || rec.Poses[0].After.Variance != 0 {
+				t.Fatalf("anchor after = %+v, want (0,0) variance 0", rec.Poses[0].After)
+			}
+			// 与锚点朝向不同的帧保留相对方向：1.5 -> 0.5（1e-20 低于 0.5 的
+			// 可表示精度，叠加后恰为 0.5）。
+			if rec.Poses[1].After.Heading != 0.5 {
+				t.Fatalf("t=20 heading = %v, want 0.5 (relative turn kept)", rec.Poses[1].After.Heading)
+			}
+			// 原本与锚点朝向完全相同的帧得到同一目标朝向，不是零也不统一成 0.5。
+			if rec.Poses[2].After.Heading != tc.target {
+				t.Fatalf("t=30 heading = %v, want %v", rec.Poses[2].After.Heading, tc.target)
+			}
+			// 历史查询与当前位姿立即反映实际结果。
+			for _, tm := range []int64{10, 30} {
+				p, err := m.PoseAt(tm)
+				if err != nil {
+					t.Fatalf("PoseAt(%d): %v", tm, err)
+				}
+				if p.Heading != tc.target {
+					t.Fatalf("PoseAt(%d) heading = %v, want %v", tm, p.Heading, tc.target)
+				}
+			}
+			cur, _ := m.CurrentPose()
+			if cur.Heading != tc.target {
+				t.Fatalf("current heading = %v, want %v", cur.Heading, tc.target)
+			}
+			// 受影响路标观测按保留的朝向转换：正前方 1 米的路标地图纵坐标
+			// 保留约 1e-20 的非零分量，符号与目标一致。
+			lms, err := m.LandmarksInRect(Rect{MinX: -1e9, MinY: -1e9, MaxX: 1e9, MaxY: 1e9})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(lms) != 1 || lms[0].ID != "L" || lms[0].X != 1 || lms[0].Y != tc.target {
+				t.Fatalf("landmark = %+v, want (1,%v): tiny lateral component lost", lms, tc.target)
+			}
+			if len(rec.Landmarks) != 1 || rec.Landmarks[0].After.Y != tc.target {
+				t.Fatalf("landmark change = %+v, want after y %v", rec.Landmarks, tc.target)
+			}
+			// 末帧带着小朝向：随后导入的运动按它定位，不按零朝向。
+			res, err := m.ImportSegment(Segment{ID: "s2", Frames: []Frame{{Time: 40, DX: 1}}})
+			if err != nil {
+				t.Fatalf("import after correction: %v", err)
+			}
+			if res.EndPose.X != 1 || res.EndPose.Y != tc.target || res.EndPose.Heading != tc.target {
+				t.Fatalf("continued end pose = %+v, want (1,%v,%v)", res.EndPose, tc.target, tc.target)
+			}
+
+			// 重开后小朝向与其定位结果、校正记录保持一致。
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m2, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer m2.Close()
+			cur, _ = m2.CurrentPose()
+			if cur.Heading != tc.target || cur.X != 1 || cur.Y != tc.target {
+				t.Fatalf("after reopen current pose = %+v, want (1,%v,%v)", cur, tc.target, tc.target)
+			}
+			p, _ := m2.PoseAt(10)
+			if p.Heading != tc.target {
+				t.Fatalf("after reopen PoseAt(10) heading = %v, want %v", p.Heading, tc.target)
+			}
+			lms, _ = m2.LandmarksInRect(Rect{MinX: -1e9, MinY: -1e9, MaxX: 1e9, MaxY: 1e9})
+			if len(lms) != 1 || lms[0].X != 1 || lms[0].Y != tc.target {
+				t.Fatalf("after reopen landmark = %+v, want (1,%v)", lms, tc.target)
+			}
+			recs, err := m2.Corrections()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recs) != 1 || len(recs[0].Poses) != 3 ||
+				recs[0].Poses[0].After.Heading != tc.target ||
+				recs[0].Poses[2].After.Heading != tc.target {
+				t.Fatalf("after reopen correction record = %+v", recs)
+			}
+		})
+	}
+}

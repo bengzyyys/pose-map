@@ -11,13 +11,14 @@ import (
 // 记录几何核对（validateLoaded，见 persistence.go）共用这同一份规则与
 // 运算次序，两处对“校正后位置与朝向”的理解因此始终一致。
 type poseShift struct {
-	x, y       float64 // 目标位置，即锚点校正后位置
-	heading    float64 // 目标朝向归一到 [-π,π)，即锚点校正后朝向
-	anchorX    float64 // 锚点校正前位置
-	anchorY    float64
-	dHeading   float64 // 归一后的最短朝向差，即各帧叠加的旋转角
-	cosD, sinD float64 // 旋转角的余弦与正弦
-	identity   bool    // 只调方差的恒等校正：位置与朝向保持原值
+	x, y          float64 // 目标位置，即锚点校正后位置
+	heading       float64 // 目标朝向归一到 [-π,π)，即锚点校正后朝向
+	anchorX       float64 // 锚点校正前位置
+	anchorY       float64
+	anchorHeading float64 // 锚点校正前朝向
+	dHeading      float64 // 归一后的最短朝向差，即各帧叠加的旋转角
+	cosD, sinD    float64 // 旋转角的余弦与正弦
+	identity      bool    // 只调方差的恒等校正：位置与朝向保持原值
 }
 
 // newPoseShift 按提交目标与锚点校正前位姿构造重定位。目标朝向先归一，
@@ -31,21 +32,30 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 	heading := normalizeAngle(tgt.Heading)
 	dHeading := normalizeAngle(heading - anchorBefore.Heading)
 	return poseShift{
-		x:        tgt.X,
-		y:        tgt.Y,
-		heading:  heading,
-		anchorX:  anchorBefore.X,
-		anchorY:  anchorBefore.Y,
-		dHeading: dHeading,
-		cosD:     math.Cos(dHeading),
-		sinD:     math.Sin(dHeading),
-		identity: dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
+		x:             tgt.X,
+		y:             tgt.Y,
+		heading:       heading,
+		anchorX:       anchorBefore.X,
+		anchorY:       anchorBefore.Y,
+		anchorHeading: anchorBefore.Heading,
+		dHeading:      dHeading,
+		cosD:          math.Cos(dHeading),
+		sinD:          math.Sin(dHeading),
+		identity:      dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
 	}
 }
 
 // apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；否则把校
-// 正前相对锚点的偏移随锚点一起旋转平移，朝向叠加同一旋转角并归一到
-// [-π,π)。帧时间与方差不属于几何规则，由调用方处理。
+// 正前相对锚点的偏移随锚点一起旋转平移。帧时间与方差不属于几何规则，由
+// 调用方处理。
+//
+// 校正后朝向按“目标朝向 + 该校正前相对锚点的朝向差”计算，而不是把旋转
+// 角加到校正前朝向上：旋转角 dHeading 本身是目标朝向减去锚点朝向的舍入
+// 结果，锚点朝向为 1 弧度而目标朝向为 1e-20 这类可表示的小角度时，差值
+// 会舍入成 -1，再加回锚点朝向就把目标朝向丢成了零。先求相对朝向差（锚
+// 点自身与原本朝向相同的帧差值恰为 0）再叠加到目标朝向上，锚点帧精确落
+// 在归一后的目标朝向，原本与锚点朝向完全相同的帧也得到同一目标朝向，
+// 其余帧保留与锚点的相对方向；结果仍归一到 [-π,π)。
 func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	if s.identity {
 		return before.X, before.Y, before.Heading
@@ -54,7 +64,7 @@ func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	dy := before.Y - s.anchorY
 	return s.x + s.cosD*dx - s.sinD*dy,
 		s.y + s.sinD*dx + s.cosD*dy,
-		normalizeAngle(before.Heading + s.dHeading)
+		normalizeAngle(s.heading + normalizeAngle(before.Heading-s.anchorHeading))
 }
 
 // Correct 提交一次已确认回环校正。
