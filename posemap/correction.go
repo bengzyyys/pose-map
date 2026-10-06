@@ -22,14 +22,18 @@ type poseShift struct {
 
 // newPoseShift 按提交目标与锚点校正前位姿构造重定位。目标朝向先归一，
 // 旋转角取归一后的最短朝向差。目标位置与锚点原位置完全相同、目标朝向归
-// 一后与原朝向等价（旋转角为 0）时是恒等校正：几何上没有任何平移或旋
+// 一后与原朝向等价（最短旋转角为 0）时是恒等校正：几何上没有任何平移或旋
 // 转，校正前后位姿必须完全相同。恒等校正不能套用旋转平移公式——公式会
 // 先求相对锚点的偏移，轨迹横跨 ±1e308 这类大坐标时该差值先溢出为
 // ±Inf、再参与浮点运算退化为 NaN，使本应成功的校正被误判为数值异常；
 // 恒等校正直接保留原位姿。
+//
+// 最短朝向差必须保留差值的真实大小与符号：1e-16 弧度的转向与 0 是不同
+// 的物理方向，若归一计算时把它与 π 做一次加减，微小差值会被浮点舍掉而
+// 误判成恒等校正（见 normalizeAngle 与 shortestAngleDiff）。
 func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 	heading := normalizeAngle(tgt.Heading)
-	dHeading := normalizeAngle(heading - anchorBefore.Heading)
+	dHeading := shortestAngleDiff(heading, anchorBefore.Heading)
 	return poseShift{
 		x:        tgt.X,
 		y:        tgt.Y,
@@ -41,6 +45,16 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 		sinD:     math.Sin(dHeading),
 		identity: dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
 	}
+}
+
+// shortestAngleDiff 返回从 b 转到 a 的最短有向角差（归一到 [-π, π)，
+// 正号表示逆时针）。两个角度都已归一到 [-π, π)，差值落在 (-2π,2π)。
+// 差值本身已在范围内时直接保留——包括 1e-16 这样范围内可表示的小角
+// 度——不能再绕经 π 折叠，否则与 π 的加减会把小差值舍成 0，丢掉真实的
+// 微小转向及其符号；只有跨 ±π 边界的差值才折叠到对侧。差为零（含 -0）
+// 时统一返回 0。
+func shortestAngleDiff(a, b float64) float64 {
+	return normalizeAngle(a - b)
 }
 
 // apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；否则把校

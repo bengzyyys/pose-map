@@ -285,12 +285,32 @@ var (
 )
 
 // normalizeAngle 把任意角度归一到 [-π, π)。
+//
+// 已经落在 [-π, π) 内的角度原样返回（逐位相同，零包括 -0 统一为 0）：
+// 范围内可表示的小角度是真实运动，不能为“归一”再与 π 做一次浮点加减而
+// 被抹掉（1e-16 与 π 同加同减后会回到 0，连续微小转角便无法累积）。只有
+// 范围外的角度才取模折叠；折叠结果为 +π 时按既有约定改记为 -π，折叠为
+// 整周倍数（包括 -0）时记为 0。
 func normalizeAngle(a float64) float64 {
-	a = math.Mod(a+math.Pi, 2*math.Pi)
-	if a < 0 {
+	if a == 0 {
+		return 0
+	}
+	if -math.Pi <= a && a < math.Pi {
+		return a
+	}
+	a = math.Mod(a, 2*math.Pi)
+	if a >= math.Pi {
+		a -= 2 * math.Pi
+	} else if a < -math.Pi {
 		a += 2 * math.Pi
 	}
-	return a - math.Pi
+	if a == math.Pi {
+		return -math.Pi
+	}
+	if a == 0 {
+		return 0
+	}
+	return a
 }
 
 // isFinite 判断数值既不是 NaN 也不是 Inf。
