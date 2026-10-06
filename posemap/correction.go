@@ -11,13 +11,14 @@ import (
 // 记录几何核对（validateLoaded，见 persistence.go）共用这同一份规则与
 // 运算次序，两处对“校正后位置与朝向”的理解因此始终一致。
 type poseShift struct {
-	x, y       float64 // 目标位置，即锚点校正后位置
-	heading    float64 // 目标朝向归一到 [-π,π)，即锚点校正后朝向
-	anchorX    float64 // 锚点校正前位置
-	anchorY    float64
-	dHeading   float64 // 归一后的最短朝向差，即各帧叠加的旋转角
-	cosD, sinD float64 // 旋转角的余弦与正弦
-	identity   bool    // 只调方差的恒等校正：位置与朝向保持原值
+	x, y          float64 // 目标位置，即锚点校正后位置
+	heading       float64 // 目标朝向归一到 [-π,π)，即锚点校正后朝向
+	anchorX       float64 // 锚点校正前位置
+	anchorY       float64
+	anchorHeading float64 // 锚点校正前朝向
+	dHeading      float64 // 归一后的最短朝向差，即各帧叠加的旋转角
+	cosD, sinD    float64 // 旋转角的余弦与正弦
+	identity      bool    // 只调方差的恒等校正：位置与朝向保持原值
 }
 
 // newPoseShift 按提交目标与锚点校正前位姿构造重定位。目标朝向先归一，
@@ -31,21 +32,30 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 	heading := normalizeAngle(tgt.Heading)
 	dHeading := normalizeAngle(heading - anchorBefore.Heading)
 	return poseShift{
-		x:        tgt.X,
-		y:        tgt.Y,
-		heading:  heading,
-		anchorX:  anchorBefore.X,
-		anchorY:  anchorBefore.Y,
-		dHeading: dHeading,
-		cosD:     math.Cos(dHeading),
-		sinD:     math.Sin(dHeading),
-		identity: dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
+		x:             tgt.X,
+		y:             tgt.Y,
+		heading:       heading,
+		anchorX:       anchorBefore.X,
+		anchorY:       anchorBefore.Y,
+		anchorHeading: anchorBefore.Heading,
+		dHeading:      dHeading,
+		cosD:          math.Cos(dHeading),
+		sinD:          math.Sin(dHeading),
+		identity:      dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
 	}
 }
 
 // apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；否则把校
 // 正前相对锚点的偏移随锚点一起旋转平移，朝向叠加同一旋转角并归一到
 // [-π,π)。帧时间与方差不属于几何规则，由调用方处理。
+//
+// 朝向按“目标朝向 + 该校正前相对锚点的朝向差”计算，而不是“校正前朝向 +
+// 旋转角”：二者在数学上（模 2π）等价，但后者先把目标朝向与锚点朝向相减
+// 再加回，当目标朝向远小于锚点朝向时（例如锚点朝向 1 弧度、目标朝向
+// 1e-20 弧度），目标朝向会在相减时被锚点朝向的精度吞掉，校正结果退化为
+// 零——有限且可表示的非零目标朝向必须作为实际定位结果保留。按相对朝向差
+// 计算时，锚点及原本与锚点朝向完全相同的帧恰好得到目标朝向本身，存在其
+// 他朝向差的帧仍保留与锚点的相对方向。
 func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	if s.identity {
 		return before.X, before.Y, before.Heading
@@ -54,7 +64,7 @@ func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	dy := before.Y - s.anchorY
 	return s.x + s.cosD*dx - s.sinD*dy,
 		s.y + s.sinD*dx + s.cosD*dy,
-		normalizeAngle(before.Heading + s.dHeading)
+		normalizeAngle(s.heading + (before.Heading - s.anchorHeading))
 }
 
 // Correct 提交一次已确认回环校正。

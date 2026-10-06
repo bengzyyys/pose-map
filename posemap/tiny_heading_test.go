@@ -270,6 +270,130 @@ func TestTinyHeadingLoopCorrection(t *testing.T) {
 	}
 }
 
+// 回环校正：锚点朝向为 1 弧度、目标朝向为 ±1e-20 弧度——目标远小于锚点
+// 朝向，但它是有限且可表示的非零角度，必须作为实际定位结果保留，不能在
+// 计算旋转角时被锚点朝向的精度吞掉而退化为零。锚点及原本与锚点朝向相同
+// 的帧都得到该目标朝向；有其他朝向差的帧保留相对方向；受影响路标观测的
+// 地图纵坐标保留约 1e-20 的非零分量（负目标时为负）；校正后的末帧朝向继
+// 续驱动随后导入的运动；重开后结果一致。
+func TestTinyTargetHeadingSurvivesLargeAnchorHeading(t *testing.T) {
+	for _, target := range []float64{1e-20, -1e-20} {
+		name := "positive"
+		if target < 0 {
+			name = "negative"
+		}
+		t.Run(name, func(t *testing.T) {
+			m := newMap(t, Config{InitialTime: 0, MaxInterval: 1000, MergeDistance: 1})
+			// t=10 锚点：原地转向 1 弧度（位置保持原点）。t=20 再转 0.5，
+			// t=30 转回 -0.5（与锚点朝向同为 1）并在自身正前方 (1,0) 观测 L。
+			if _, err := m.ImportSegment(Segment{ID: "s", Frames: []Frame{
+				{Time: 10, DHeading: 1},
+				{Time: 20, DHeading: 0.5},
+				{Time: 30, DHeading: -0.5, Observations: []Observation{{ID: "L", X: 1, Y: 0}}},
+			}}); err != nil {
+				t.Fatalf("ImportSegment: %v", err)
+			}
+			rec, err := m.Correct(Correction{
+				ID:     "c",
+				Anchor: 10,
+				Target: CorrectionTarget{X: 0, Y: 0, Heading: target, Variance: 0},
+			})
+			if err != nil {
+				t.Fatalf("Correct: %v", err)
+			}
+			if len(rec.Poses) != 3 {
+				t.Fatalf("pose changes = %d, want 3", len(rec.Poses))
+			}
+			// 锚点：朝向从 1 变为目标小角度本身，不是零。
+			if rec.Poses[0].Before.Heading != 1 || rec.Poses[0].After.Heading != target {
+				t.Fatalf("anchor heading %v -> %v, want 1 -> %v", rec.Poses[0].Before.Heading, rec.Poses[0].After.Heading, target)
+			}
+			// 与锚点朝向差 +0.5 的帧保留相对方向。
+			want20 := normalizeAngle(target + 0.5)
+			if rec.Poses[1].After.Heading != want20 {
+				t.Fatalf("frame 20 heading = %v, want %v", rec.Poses[1].After.Heading, want20)
+			}
+			// 原本与锚点朝向完全相同的末帧得到同一目标朝向。
+			if rec.Poses[2].Before.Heading != 1 || rec.Poses[2].After.Heading != target {
+				t.Fatalf("frame 30 heading %v -> %v, want 1 -> %v", rec.Poses[2].Before.Heading, rec.Poses[2].After.Heading, target)
+			}
+			// 历史查询与当前位姿都反映实际校正结果。
+			for _, tm := range []int64{10, 30} {
+				p, err := m.PoseAt(tm)
+				if err != nil {
+					t.Fatalf("PoseAt(%d): %v", tm, err)
+				}
+				if p.Heading != target {
+					t.Fatalf("PoseAt(%d) heading = %v, want %v", tm, p.Heading, target)
+				}
+			}
+			if p, _ := m.PoseAt(20); p.Heading != want20 {
+				t.Fatalf("PoseAt(20) heading = %v, want %v", p.Heading, want20)
+			}
+			if cur, _ := m.CurrentPose(); cur.Heading != target {
+				t.Fatalf("current heading = %v, want %v", cur.Heading, target)
+			}
+			// 路标观测按保留的小朝向转换：正前方 1 米的路标地图纵坐标保留
+			// 与目标同号的非零分量（sin(±1e-20) 在 float64 中即 ±1e-20）。
+			if len(rec.Landmarks) != 1 || rec.Landmarks[0].ID != "L" {
+				t.Fatalf("landmark changes = %+v", rec.Landmarks)
+			}
+			if la := rec.Landmarks[0].After; la.X != 1 || la.Y != target {
+				t.Fatalf("landmark after = (%v,%v), want (1,%v)", la.X, la.Y, target)
+			}
+			lms, err := m.LandmarksInRect(Rect{MinX: -1e9, MinY: -1e9, MaxX: 1e9, MaxY: 1e9})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(lms) != 1 || lms[0].X != 1 || lms[0].Y != target {
+				t.Fatalf("landmarks = %+v, want (1,%v)", lms, target)
+			}
+			// 校正后的末帧带有小朝向：随后导入的前进运动按它定位，留下同
+			// 号的横向分量，而不是重新按零朝向定位。
+			res, err := m.ImportSegment(Segment{ID: "s2", Frames: []Frame{
+				{Time: 40, DX: 1, DHeading: 0},
+			}})
+			if err != nil {
+				t.Fatalf("ImportSegment after correction: %v", err)
+			}
+			if res.EndPose.Heading != target || res.EndPose.X != 1 || res.EndPose.Y != target {
+				t.Fatalf("end pose = (%v,%v,%v), want (1,%v,%v)",
+					res.EndPose.X, res.EndPose.Y, res.EndPose.Heading, target, target)
+			}
+
+			// 重开后当前位姿、历史查询、路标与校正记录保持一致。
+			path := m.Path()
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m2, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer m2.Close()
+			if cur, _ := m2.CurrentPose(); cur.Heading != target || cur.X != 1 || cur.Y != target {
+				t.Fatalf("after reopen current pose = %+v, want (1,%v,%v)", cur, target, target)
+			}
+			if p, _ := m2.PoseAt(10); p.Heading != target {
+				t.Fatalf("after reopen PoseAt(10) heading = %v, want %v", p.Heading, target)
+			}
+			lms, _ = m2.LandmarksInRect(Rect{MinX: -1e9, MinY: -1e9, MaxX: 1e9, MaxY: 1e9})
+			if len(lms) != 1 || lms[0].X != 1 || lms[0].Y != target {
+				t.Fatalf("after reopen landmark = %+v, want (1,%v)", lms, target)
+			}
+			recs, err := m2.Corrections()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recs) != 1 || len(recs[0].Poses) != 3 ||
+				recs[0].Poses[0].After.Heading != target ||
+				recs[0].Poses[2].After.Heading != target {
+				t.Fatalf("after reopen correction record = %+v", recs)
+			}
+		})
+	}
+}
+
 // 跨越 ±π 边界的校正仍表示同一个物理方向：锚点朝向在 +π 附近，目标再向
 // 正方向越过 +π，结果归一为 -π 一侧的等价角度，锚点位置不变。
 func TestTinyHeadingCorrectionAcrossPiBoundary(t *testing.T) {
