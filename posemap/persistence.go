@@ -930,6 +930,62 @@ func validateLoaded(fd *fileData) error {
 		}
 		corrIDs[cr.ID] = struct{}{}
 	}
+	// 保存轨迹与最后一次覆盖校正的一致性核对：每条记录自身的前后值可以
+	// 合法，却不能保证当前保存的轨迹就是各帧“最后一次”校正的结果——后来
+	// 对重叠范围的再次校正只以当时状态为起点另写一条新记录，旧记录永不被
+	// 改写；若保存位姿停留在某次更早校正的结果（或任何其他值），历史位姿
+	// 查询就会与最后一条覆盖该帧的记录互相矛盾。因此对每个已导入帧，按
+	// 提交次序取最后一条覆盖它的校正记录：仅当该记录整个范围都有完整逐帧
+	// 依据时，保存的位置、朝向、位置方差必须与该记录中该帧的校正后值相
+	// 符——范围内每一帧都核对，包括各记录的锚点与结束帧；范围内没有任何
+	// 路标观测的帧同样在此核对，不能依赖路标重放间接暴露矛盾。坐标容差与
+	// 记录几何核对相同（coordClose）：1e-9 乘以 1 与两个待比较坐标绝对值
+	// 三者的最大值；朝向按最短角度差比较，容差 1e-9 弧度；方差必须完全一
+	// 致。路标合并距离只是导入/校正时的观测接纳门槛，不能用来放宽这些要
+	// 求。容差内的差异照常打开，查询与记录都保留文件原值，不借容差改写。
+	// 兼容规则与记录内部核对一致：最后一条覆盖某帧的记录范围内含 null 旧
+	// 帧时，该帧跳过比较，不改用更早的依据完整记录要求当前位姿回到旧结
+	// 果（再次校正后的当前值本就不必等于旧记录的校正后值）；其他以依据完
+	// 整记录为最后一次覆盖校正的帧不受影响，仍逐一核对。从未被任何校正覆
+	// 盖的帧没有可矛盾的记录，不核对。
+	for j := 1; j < len(fd.Trajectory); j++ {
+		last := -1
+		for i, r := range corrRanges {
+			if j >= r.anchorIdx && j <= r.endIdx {
+				last = i
+			}
+		}
+		if last < 0 {
+			continue // 该帧从未被校正：保存值即其唯一历史值。
+		}
+		r := corrRanges[last]
+		if !r.fullyBased {
+			continue // 最后一次覆盖记录缺少逐帧依据：保留旧文件的打开规则。
+		}
+		cr := fd.Corrections[last]
+		// 记录覆盖 [anchorIdx,endIdx] 的每一帧且按轨迹次序排列（已在上方
+		// 核对），帧 j 的校正后值即 Poses[j-anchorIdx].After。
+		after := cr.Poses[j-r.anchorIdx].After
+		got := fd.Trajectory[j]
+		t := got.Time
+		if !finitePose(got) {
+			// 最后一次校正的校正后值已核对为有限，保存轨迹非有限本身即矛盾；
+			// 也避免非有限值在容差比较中被误判相等。
+			return fmt.Errorf("%w: saved pose at frame time %d does not match correction %s which is the last correction covering it", ErrCorrupt, t, cr.ID)
+		}
+		if !coordClose(got.X, after.X) {
+			return fmt.Errorf("%w: saved pose at frame time %d has x %v but correction %s, the last correction covering it, records corrected x %v", ErrCorrupt, t, got.X, cr.ID, after.X)
+		}
+		if !coordClose(got.Y, after.Y) {
+			return fmt.Errorf("%w: saved pose at frame time %d has y %v but correction %s, the last correction covering it, records corrected y %v", ErrCorrupt, t, got.Y, cr.ID, after.Y)
+		}
+		if !angleClose(got.Heading, after.Heading) {
+			return fmt.Errorf("%w: saved pose at frame time %d has heading %v but correction %s, the last correction covering it, records corrected heading %v", ErrCorrupt, t, got.Heading, cr.ID, after.Heading)
+		}
+		if got.Variance != after.Variance {
+			return fmt.Errorf("%w: saved pose at frame time %d has variance %v but correction %s, the last correction covering it, records corrected variance %v", ErrCorrupt, t, got.Variance, cr.ID, after.Variance)
+		}
+	}
 	// 段首次导入结果核对：重复导入原段时直接返回保存的首次结果，因此保存
 	// 的末位姿必须确实就是该段首次成功导入时的末位姿，不能被写成与历史
 	// 轨迹不符的值。末位姿时间必须准确命中一个已导入帧：trajectory[0]
