@@ -1000,6 +1000,97 @@ func validateLoaded(fd *fileData) error {
 			}
 		}
 	}
+	// 段首次导入结果核对。每个已保存段的末位姿时间必须准确对应一个已导入
+	// 帧：trajectory[0] 是初始位姿，不是任何段的末帧；也不能借用时间查询
+	// “不晚于指定时间”的最近帧——时间没有逐字命中某个已导入帧即按损坏
+	// 拒绝。这一项只依赖保存的轨迹时间，纯旧文件（缺省 sources）同样适用。
+	//
+	// 末位姿的位置、朝向与方差必须等于该段首次成功导入时的末位姿：若该帧
+	// 从未受到校正，就是它保存的原始位姿；一旦受到校正，则是它首次受到校
+	// 正前的位姿——按提交次序第一条锚点不晚于该帧、结束时间不早于该帧的校
+	// 正记录的 Before 快照，不是任意一次校正后的值，也不是当前轨迹位姿。
+	// 对相同帧多次校正、校正范围只覆盖旧段的一部分、校正之后继续导入新
+	// 段，都不改写旧段的首次结果；范围没有包含该末帧的校正同样不改变它。
+	// 位置比较沿用与校正记录几何核对相同的浮点容差（coordClose，与路标合
+	// 并距离无关），朝向按最短角度差比较（angleClose），方差必须精确一致。
+	//
+	// 仅当该末帧与（若有）最早覆盖它的校正范围都具有完整逐帧依据时才核对
+	// 数值：覆盖范围含 null 旧帧时第一次校正的 Before 快照无法确认，保留
+	// 旧文件的既有打开规则；末帧本身来自 null 旧帧时其原始位姿同样无从核
+	// 对。兼容只跳过数值一致性，末位姿时间仍须命中真实导入帧；旧地图之后
+	// 新追加且依据完整的段照常核对。
+	for _, sg := range fd.Segments {
+		end := sg.Result.EndPose.Time
+		endIdx := -1
+		for j := 1; j < len(fd.Trajectory); j++ {
+			if fd.Trajectory[j].Time == end {
+				endIdx = j
+				break
+			}
+		}
+		if endIdx < 0 {
+			return fmt.Errorf("%w: segment %s end pose time %d does not match an imported frame", ErrCorrupt, sg.ID, end)
+		}
+		if !finitePose(sg.Result.EndPose) {
+			return fmt.Errorf("%w: segment %s end pose at frame time %d is non-finite", ErrCorrupt, sg.ID, end)
+		}
+		// 找按提交次序第一条覆盖该末帧的校正记录。前面已核对过每条记录的
+		// 锚点/结束时间都命中已导入帧、锚点不晚于结束时间且条目完整覆盖其
+		// 范围，这里直接按时间包含关系判断即可。
+		firstCovering := -1
+		for i := range fd.Corrections {
+			cr := fd.Corrections[i]
+			if cr.Anchor <= end && end <= cr.EndTime {
+				firstCovering = i
+				break
+			}
+		}
+		// 数值核对所需依据：末帧必须有逐帧来源；最早覆盖它的校正范围（若
+		// 有）内每个来源帧都非 null——否则该记录的 Before 快照无法由依据
+		// 确认。与校正记录核对相同，纯旧文件缺省 sources 时整体不核对数值。
+		based := len(fd.Sources) != 0 && fd.Sources[endIdx-1] != nil
+		var anchorIdx, coverEndIdx int
+		if based && firstCovering >= 0 {
+			cr := fd.Corrections[firstCovering]
+			anchorIdx, coverEndIdx = -1, -1
+			for j := 1; j < len(fd.Trajectory); j++ {
+				if fd.Trajectory[j].Time == cr.Anchor {
+					anchorIdx = j
+				}
+				if fd.Trajectory[j].Time == cr.EndTime {
+					coverEndIdx = j
+				}
+			}
+			for k := anchorIdx - 1; k <= coverEndIdx-1; k++ {
+				if fd.Sources[k] == nil {
+					based = false
+					break
+				}
+			}
+		}
+		if !based {
+			continue
+		}
+		// 首次导入末位姿：无覆盖校正时取当前保存的原始位姿；否则取第一条
+		// 覆盖记录中该帧的 Before 快照（记录条目与帧一一对应已在前面核
+		// 对）。不能用该记录的 After 或当前轨迹位姿替换原结果。
+		var want Pose
+		if firstCovering < 0 {
+			want = fd.Trajectory[endIdx]
+		} else {
+			want = fd.Corrections[firstCovering].Poses[endIdx-anchorIdx].Before
+		}
+		got := sg.Result.EndPose
+		if !coordClose(got.X, want.X) || !coordClose(got.Y, want.Y) {
+			return fmt.Errorf("%w: segment %s end pose at frame time %d is saved at (%v,%v) but its first import ended at (%v,%v)", ErrCorrupt, sg.ID, end, got.X, got.Y, want.X, want.Y)
+		}
+		if !angleClose(got.Heading, want.Heading) {
+			return fmt.Errorf("%w: segment %s end pose at frame time %d has saved heading %v but its first import heading was %v", ErrCorrupt, sg.ID, end, got.Heading, want.Heading)
+		}
+		if got.Variance != want.Variance {
+			return fmt.Errorf("%w: segment %s end pose at frame time %d has saved variance %v but its first import variance was %v", ErrCorrupt, sg.ID, end, got.Variance, want.Variance)
+		}
+	}
 	return nil
 }
 
