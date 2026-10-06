@@ -31,6 +31,8 @@ func buildTimedMap(t *testing.T, path string, cfg Config, times ...int64) {
 }
 
 // setTrajectoryTimes 重写文件中保存的轨迹时间（长度不变）并重算校验和。
+// 段记录的末位姿时间随之改指新的末帧时间，使仅改动时间的文件在段首次
+// 导入结果核对下仍保持一致（该核对有专门的测试覆盖）。
 func setTrajectoryTimes(t *testing.T, path string, times ...int64) {
 	t.Helper()
 	fd := readFileData(t, path)
@@ -39,6 +41,9 @@ func setTrajectoryTimes(t *testing.T, path string, times ...int64) {
 	}
 	for i, tm := range times {
 		fd.Trajectory[i].Time = tm
+	}
+	for i := range fd.Segments {
+		fd.Segments[i].Result.EndPose.Time = times[len(times)-1]
 	}
 	writeFileDataRaw(t, path, &fd)
 }

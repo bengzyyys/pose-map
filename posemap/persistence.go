@@ -707,6 +707,14 @@ func validateLoaded(fd *fileData) error {
 		segIDs[sg.ID] = struct{}{}
 	}
 	corrIDs := make(map[string]struct{}, len(fd.Corrections))
+	// corrRanges 按提交次序记录每条校正覆盖的轨迹下标范围 [anchor,end]
+	// 与范围内逐帧依据是否完整，供下方段首次导入结果核对定位“首次覆盖
+	// 某帧的校正”及其校正前值。
+	type corrRange struct {
+		anchorIdx, endIdx int
+		fullyBased        bool
+	}
+	corrRanges := make([]corrRange, 0, len(fd.Corrections))
 	for _, cr := range fd.Corrections {
 		if cr.ID == "" || cr.Anchor > cr.EndTime {
 			return fmt.Errorf("%w: invalid correction record", ErrCorrupt)
@@ -759,6 +767,7 @@ func validateLoaded(fd *fileData) error {
 				}
 			}
 		}
+		corrRanges = append(corrRanges, corrRange{anchorIdx: anchorIdx, endIdx: endIdx, fullyBased: fullyBased})
 		if fullyBased {
 			// 校正后方差核对：锚点帧的校正后方差必须等于该次提交的目标
 			// 方差；其后每帧在目标方差上，按时间顺序累加锚点之后至该帧
@@ -920,6 +929,80 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: duplicate correction %s", ErrCorrupt, cr.ID)
 		}
 		corrIDs[cr.ID] = struct{}{}
+	}
+	// 段首次导入结果核对：重复导入原段时直接返回保存的首次结果，因此保存
+	// 的末位姿必须确实就是该段首次成功导入时的末位姿，不能被写成与历史
+	// 轨迹不符的值。末位姿时间必须准确命中一个已导入帧：trajectory[0]
+	// 是初始位姿，不是导入帧；也不能借用时间查询中“不晚于指定时间”的
+	// 最近帧。轨迹时间已校验严格递增，命中即唯一。时间不成立即按损坏拒
+	// 绝，不返回可用地图，也不改写原文件。
+	for _, sg := range fd.Segments {
+		t := sg.Result.EndPose.Time
+		endIdx := -1
+		for j := 1; j < len(fd.Trajectory); j++ {
+			if fd.Trajectory[j].Time == t {
+				endIdx = j
+				break
+			}
+		}
+		if endIdx < 0 {
+			return fmt.Errorf("%w: segment %s records end pose time %d which does not match an imported frame", ErrCorrupt, sg.ID, t)
+		}
+		// 数值一致性核对只对末帧及涉及它的校正范围都具有完整逐帧依据的
+		// 段进行。旧文件缺省 sources、末帧是缺少依据的 null 旧帧、或某一
+		// 条覆盖末帧的校正范围内含 null 旧帧时，首次导入时的末位姿无从
+		// 确认：保留旧地图的既有打开规则，不推测其原始位置、朝向和方差；
+		// 这种兼容只跳过数值一致性检查，上面的末位姿时间核对仍然适用。
+		if len(fd.Sources) == 0 || fd.Sources[endIdx-1] == nil {
+			continue
+		}
+		// 期望值的确定与校正历史无关的部分先取当前保存的该帧位姿：末帧
+		// 从未被任何校正范围覆盖时，轨迹未被改写，保存值即首次导入值。
+		// 覆盖末帧的校正按提交次序取第一条，其校正前值即该帧首次受到校
+		// 正前的位姿——也就是首次导入时的末位姿；之后对相同帧的再校正、
+		// 只覆盖该段一部分而不含末帧的校正、以及校正之后追加的新段，都
+		// 不改写它。只调方差的恒等校正同样适用：校正前方差即原始方差，
+		// 不能与目标方差混同。覆盖末帧但依据不完整的校正使整份核对无法
+		// 确认，按上方兼容规则跳过。
+		want := fd.Trajectory[endIdx]
+		checkable := true
+		first := true
+		for i, cr := range fd.Corrections {
+			r := corrRanges[i]
+			if endIdx < r.anchorIdx || endIdx > r.endIdx {
+				continue // 范围不含该末帧的校正不改变它对应的值
+			}
+			if !r.fullyBased {
+				checkable = false
+				break
+			}
+			if first {
+				want = cr.Poses[endIdx-r.anchorIdx].Before
+				first = false
+			}
+		}
+		if !checkable {
+			continue
+		}
+		// 位置沿用校正记录几何核对的浮点容差（coordClose），朝向按实际
+		// 方向比较（angleClose 处理 ±π 跨边界），方差必须精确一致。路标
+		// 合并距离只是导入/校正时的观测接纳门槛，不能用来容忍段结果的
+		// 偏差。任何一项不符都按损坏拒绝，说明段标识与末位姿时间。
+		got := sg.Result.EndPose
+		if !finitePose(got) {
+			// 首次导入结果必为有限值（导入时非有限即整段拒绝），保存值
+			// 非有限本身即矛盾；也避免非有限值在容差比较中被误判相等。
+			return fmt.Errorf("%w: segment %s records non-finite end pose at frame time %d", ErrCorrupt, sg.ID, t)
+		}
+		if !coordClose(got.X, want.X) || !coordClose(got.Y, want.Y) {
+			return fmt.Errorf("%w: segment %s records end pose position (%v,%v) at frame time %d but its first import recorded (%v,%v)", ErrCorrupt, sg.ID, got.X, got.Y, t, want.X, want.Y)
+		}
+		if !angleClose(got.Heading, want.Heading) {
+			return fmt.Errorf("%w: segment %s records end pose heading %v at frame time %d but its first import recorded %v", ErrCorrupt, sg.ID, got.Heading, t, want.Heading)
+		}
+		if got.Variance != want.Variance {
+			return fmt.Errorf("%w: segment %s records end pose variance %v at frame time %d but its first import recorded %v", ErrCorrupt, sg.ID, got.Variance, t, want.Variance)
+		}
 	}
 	// 路标记录按标识索引，供失效记录与出现历史的交叉核对使用。
 	lmByID := make(map[string]*landmarkJSON, len(fd.Landmarks))
