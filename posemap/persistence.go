@@ -930,6 +930,62 @@ func validateLoaded(fd *fileData) error {
 		}
 		corrIDs[cr.ID] = struct{}{}
 	}
+	// 当前保存轨迹与“作用于该帧的最后一次校正”一致性核对：上面的几何
+	// 核对只确认每条记录自身保存的前后值描述同一次刚体重定位，不确认
+	// 当前轨迹中的保存位姿就是按提交次序最后一条覆盖该帧的记录的校正
+	// 后结果——两条记录各自合法、校验和正确，但当前轨迹可能与最后一次
+	// 校正的结果矛盾（例如覆盖 100~300 的第一条校正后追加 400 帧，第二
+	// 条覆盖 200~400，则当前 100 对应第一条、200/300/400 对应第二条；
+	// 后来追加的 500 帧不属于任一条，旧记录也不因后续校正而被改写）。
+	// 对每个已导入帧 j（trajectory[0] 是初始位姿，不是可校正的帧），先
+	// 按提交次序求最后一条覆盖它的记录（不论依据是否完整）：若该记录
+	// 范围内逐帧依据完整，就把其该帧的校正后值作为期望，逐帧核对保存
+	// 的位置、朝向与位置方差，锚点与结束帧同样在内；范围内没有任何路
+	// 标观测的帧也必须符合（直接逐帧比对，不借路标位置核对间接发现矛
+	// 盾）。兼容规则：最后一条覆盖记录范围内含缺少逐帧依据的 null 旧
+	// 帧时跳过该帧的比较，而不是回退到更早的完整依据记录要求当前位姿
+	// 回到旧结果；其前后帧若最后覆盖记录不同且该记录依据完整，仍须核
+	// 对；没有任何覆盖记录的帧不核对，纯旧文件因此全部自然跳过。位置
+	// 用 coordClose、朝向用 angleClose（均为 1e-9 相对/绝对容差，处理
+	// ±π 跨边界），方差必须完全一致；合并距离只是导入/校正时的观测接
+	// 纳门槛，不能用来放宽这些要求。
+	lastByFrame := make([]int, len(fd.Trajectory))
+	for j := range lastByFrame {
+		lastByFrame[j] = -1
+	}
+	for i := range fd.Corrections {
+		r := corrRanges[i]
+		for j := r.anchorIdx; j <= r.endIdx; j++ {
+			lastByFrame[j] = i
+		}
+	}
+	for j := 1; j < len(fd.Trajectory); j++ {
+		i := lastByFrame[j]
+		if i < 0 || !corrRanges[i].fullyBased {
+			// 没有任何覆盖记录，或最后一条覆盖该帧的记录范围内含缺少
+			// 逐帧依据的 null 旧帧：按兼容规则跳过，不改用更早记录。
+			continue
+		}
+		cr := fd.Corrections[i]
+		r := corrRanges[i]
+		want := cr.Poses[j-r.anchorIdx].After
+		got := fd.Trajectory[j]
+		if !finitePose(got) {
+			return fmt.Errorf("%w: frame at time %d contradicts its last correction %s: saved pose is non-finite", ErrCorrupt, got.Time, cr.ID)
+		}
+		if !coordClose(got.X, want.X) {
+			return fmt.Errorf("%w: correction %s is the last correction covering frame time %d but saved x %v does not match its corrected x %v", ErrCorrupt, cr.ID, got.Time, got.X, want.X)
+		}
+		if !coordClose(got.Y, want.Y) {
+			return fmt.Errorf("%w: correction %s is the last correction covering frame time %d but saved y %v does not match its corrected y %v", ErrCorrupt, cr.ID, got.Time, got.Y, want.Y)
+		}
+		if !angleClose(got.Heading, want.Heading) {
+			return fmt.Errorf("%w: correction %s is the last correction covering frame time %d but saved heading %v does not match its corrected heading %v", ErrCorrupt, cr.ID, got.Time, got.Heading, want.Heading)
+		}
+		if got.Variance != want.Variance {
+			return fmt.Errorf("%w: correction %s is the last correction covering frame time %d but saved variance %v does not match its corrected variance %v", ErrCorrupt, cr.ID, got.Time, got.Variance, want.Variance)
+		}
+	}
 	// 段首次导入结果核对：重复导入原段时直接返回保存的首次结果，因此保存
 	// 的末位姿必须确实就是该段首次成功导入时的末位姿，不能被写成与历史
 	// 轨迹不符的值。末位姿时间必须准确命中一个已导入帧：trajectory[0]
