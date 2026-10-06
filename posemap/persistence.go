@@ -930,6 +930,52 @@ func validateLoaded(fd *fileData) error {
 		}
 		corrIDs[cr.ID] = struct{}{}
 	}
+	// 相邻校正衔接核对：同一帧再次被校正时，本次记录的校正前值必须承接
+	// 此前最后一次覆盖该帧的记录的校正后值——上面的几何核对只确认每条
+	// 记录自身的前后值描述同一次刚体重定位，不确认两次校正之间的承接关
+	// 系；没有这项核对，即使校验和正确、每条记录各自合法，两条记录仍可
+	// 对同一帧给出互相矛盾的历史。按提交次序逐帧维护“最后一次覆盖该帧
+	// 的记录”：中间提交但未覆盖该帧的校正不改变它的上次结果；两次校正
+	// 只部分重叠时只对共同涉及的帧检查；没有前次覆盖的帧（如先校正
+	// 100~300、追加 400、再校正 200~400 时的 400）不要求衔接。位置用
+	// coordClose、朝向用 angleClose（均为 1e-9 相对/绝对容差，处理 ±π
+	// 跨边界），方差必须完全一致；衔接不符即按损坏拒绝整份文件，即使当
+	// 前轨迹与最后一次校正一致、或这些帧没有路标观测，也不能放过。兼容
+	// 规则与最后一次校正核对相同：前后两次校正任一范围内含缺少逐帧依据
+	// 的 null 旧帧时跳过该处比较，但不越过这次记录改用更早结果——上次
+	// 结果仍以最后一次覆盖记录为准；同一文件内其他依据完整的衔接仍须检
+	// 查。校正记录保持提交时的快照与次序，不为消除矛盾而改写。
+	prevByFrame := make([]int, len(fd.Trajectory))
+	for j := range prevByFrame {
+		prevByFrame[j] = -1
+	}
+	for i := range fd.Corrections {
+		r := corrRanges[i]
+		cr := fd.Corrections[i]
+		for j := r.anchorIdx; j <= r.endIdx; j++ {
+			p := prevByFrame[j]
+			if p >= 0 && r.fullyBased && corrRanges[p].fullyBased {
+				prev := fd.Corrections[p]
+				want := prev.Poses[j-corrRanges[p].anchorIdx].After
+				got := cr.Poses[j-r.anchorIdx].Before
+				t := fd.Trajectory[j].Time
+				if !coordClose(got.X, want.X) {
+					return fmt.Errorf("%w: correction %s records pre-correction x %v at frame time %d but the previous correction %s covering that frame recorded corrected x %v", ErrCorrupt, cr.ID, got.X, t, prev.ID, want.X)
+				}
+				if !coordClose(got.Y, want.Y) {
+					return fmt.Errorf("%w: correction %s records pre-correction y %v at frame time %d but the previous correction %s covering that frame recorded corrected y %v", ErrCorrupt, cr.ID, got.Y, t, prev.ID, want.Y)
+				}
+				if !angleClose(got.Heading, want.Heading) {
+					return fmt.Errorf("%w: correction %s records pre-correction heading %v at frame time %d but the previous correction %s covering that frame recorded corrected heading %v", ErrCorrupt, cr.ID, got.Heading, t, prev.ID, want.Heading)
+				}
+				if got.Variance != want.Variance {
+					return fmt.Errorf("%w: correction %s records pre-correction variance %v at frame time %d but the previous correction %s covering that frame recorded corrected variance %v", ErrCorrupt, cr.ID, got.Variance, t, prev.ID, want.Variance)
+				}
+			}
+			// 不论是否比较，本记录都成为该帧新的最后一次覆盖记录。
+			prevByFrame[j] = i
+		}
+	}
 	// 当前保存轨迹与“作用于该帧的最后一次校正”一致性核对：上面的几何
 	// 核对只确认每条记录自身保存的前后值描述同一次刚体重定位，不确认
 	// 当前轨迹中的保存位姿就是按提交次序最后一条覆盖该帧的记录的校正
