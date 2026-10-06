@@ -415,8 +415,11 @@ func TestTinyHeadingCorrectionAcrossPiBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Correct: %v", err)
 	}
-	dHeading := normalizeAngle(normalizeAngle(targetHeading) - anchorHeading)
-	want := normalizeAngle(anchorHeading + dHeading)
+	// 锚点（相对朝向差为零）直接采用归一后的目标朝向本身——不能先算最短
+	// 朝向差再加回锚点朝向：那次相减在 π 量级会损失一个 ULP，得到的等价
+	// 角度偏离目标一个可表示余量（poseShift.apply 的同一精度规则，见
+	// correction.go）。
+	want := normalizeAngle(targetHeading)
 	if want >= 0 {
 		t.Fatalf("test setup: expected wrap to the -pi side, got %v", want)
 	}
