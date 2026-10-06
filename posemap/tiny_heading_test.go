@@ -415,8 +415,9 @@ func TestTinyHeadingCorrectionAcrossPiBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Correct: %v", err)
 	}
-	dHeading := normalizeAngle(normalizeAngle(targetHeading) - anchorHeading)
-	want := normalizeAngle(anchorHeading + dHeading)
+	// 锚点采用归一后的目标朝向本身：对整圈取精确余数后，它就是目标角度
+	// 在 [-π,π) 内的等价角度（此处落在 -π 一侧）。
+	want := normalizeAngle(targetHeading)
 	if want >= 0 {
 		t.Fatalf("test setup: expected wrap to the -pi side, got %v", want)
 	}
