@@ -930,6 +930,66 @@ func validateLoaded(fd *fileData) error {
 		}
 		corrIDs[cr.ID] = struct{}{}
 	}
+	// 校正衔接核对：上面的几何核对只确认每条记录自身保存的前后值描述
+	// 同一次刚体重定位，不确认后一次校正的起点承接前一次的结果——两条
+	// 记录各自合法、校验和正确，仍可能对同一帧给出互相矛盾的历史（例如
+	// 先校正 100~300，追加 400，再校正 200~400：第二条记录中 200、300
+	// 的校正前值必须承接第一条的校正后值）。对每条记录 cur（除第一条
+	// 外）覆盖的每一帧，按提交次序向前找此前最后一条同样覆盖该帧的记
+	// 录 prev：cur 中该帧的校正前位置、朝向与方差必须与 prev 中该帧的
+	// 校正后值相符。两条记录只部分重叠时只对共同涉及的帧检查；cur 覆盖
+	// 而此前没有任何记录覆盖的帧（如上例的 400）没有前次结果可承接，
+	// 不因缺少衔接被拒绝；两次校正之间提交但不覆盖该帧的记录不改变它
+	// 的上次结果。兼容规则与最后一次校正核对一致：cur 或 prev 任一范
+	// 围内含缺少逐帧依据的 null 旧帧时，该帧的衔接无从确认，跳过比较，
+	// 且不越过 prev 改用更早记录的结果；同一文件内其他依据完整的衔接
+	// 仍须检查。位置用 coordClose、朝向用 angleClose（均为 1e-9 相对/
+	// 绝对容差，处理 ±π 跨边界），方差必须完全一致；范围内帧是否有路
+	// 标观测不影响本核对。发现矛盾即按损坏拒绝整份地图，错误指出前后
+	// 两次校正标识与矛盾帧时间；记录保持提交时的快照与次序，不为消除
+	// 矛盾而改写。
+	for i := 1; i < len(fd.Corrections); i++ {
+		cur := fd.Corrections[i]
+		ri := corrRanges[i]
+		if !ri.fullyBased {
+			continue // 本次记录依据不完整：其覆盖帧的衔接全部跳过
+		}
+		for j := ri.anchorIdx; j <= ri.endIdx; j++ {
+			prev := -1
+			for k := i - 1; k >= 0; k-- {
+				rk := corrRanges[k]
+				if j >= rk.anchorIdx && j <= rk.endIdx {
+					prev = k
+					break
+				}
+			}
+			if prev < 0 {
+				continue // 该帧此前未被任何校正覆盖，没有可承接的上次结果
+			}
+			rp := corrRanges[prev]
+			if !rp.fullyBased {
+				// 上次覆盖该帧的记录依据不完整：跳过该处比较，不越过它
+				// 改用更早记录。
+				continue
+			}
+			before := cur.Poses[j-ri.anchorIdx].Before
+			after := fd.Corrections[prev].Poses[j-rp.anchorIdx].After
+			prv := fd.Corrections[prev]
+			t := fd.Trajectory[j].Time
+			if !coordClose(before.X, after.X) {
+				return fmt.Errorf("%w: correction %s records pre-correction x %v at frame time %d but the last earlier correction %s covering it left x %v", ErrCorrupt, cur.ID, before.X, t, prv.ID, after.X)
+			}
+			if !coordClose(before.Y, after.Y) {
+				return fmt.Errorf("%w: correction %s records pre-correction y %v at frame time %d but the last earlier correction %s covering it left y %v", ErrCorrupt, cur.ID, before.Y, t, prv.ID, after.Y)
+			}
+			if !angleClose(before.Heading, after.Heading) {
+				return fmt.Errorf("%w: correction %s records pre-correction heading %v at frame time %d but the last earlier correction %s covering it left heading %v", ErrCorrupt, cur.ID, before.Heading, t, prv.ID, after.Heading)
+			}
+			if before.Variance != after.Variance {
+				return fmt.Errorf("%w: correction %s records pre-correction variance %v at frame time %d but the last earlier correction %s covering it left variance %v", ErrCorrupt, cur.ID, before.Variance, t, prv.ID, after.Variance)
+			}
+		}
+	}
 	// 当前保存轨迹与“作用于该帧的最后一次校正”一致性核对：上面的几何
 	// 核对只确认每条记录自身保存的前后值描述同一次刚体重定位，不确认
 	// 当前轨迹中的保存位姿就是按提交次序最后一条覆盖该帧的记录的校正
