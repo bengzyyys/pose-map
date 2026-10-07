@@ -19,6 +19,8 @@ type poseShift struct {
 	dHeading      float64 // 归一后的最短朝向差，即各帧叠加的旋转角
 	cosD, sinD    float64 // 旋转角的余弦与正弦
 	identity      bool    // 只调方差的恒等校正：位置与朝向保持原值
+	fixX          bool    // 纯平移且该轴平移量恰为零：该轴每帧坐标原样保留
+	fixY          bool
 }
 
 // newPoseShift 按提交目标与锚点校正前位姿构造重定位。目标朝向先归一，
@@ -28,6 +30,14 @@ type poseShift struct {
 // 先求相对锚点的偏移，轨迹横跨 ±1e308 这类大坐标时该差值先溢出为
 // ±Inf、再参与浮点运算退化为 NaN，使本应成功的校正被误判为数值异常；
 // 恒等校正直接保留原位姿。
+//
+// 没有旋转（dHeading==0）的纯平移还要按轴区分：某一轴的平移量恰为零
+// 时，该轴每一帧校正后坐标就等于其校正前坐标（锚点在该轴不动、其余帧
+// 保留相对位置），记在 fixX/fixY 中。apply 对该轴直接取校正前坐标，而
+// 不是先算 before-anchor——即使整条轨迹在另一轴的平移下横跨 ±1e308，
+// 未移动的这一轴也不会因相对锚点偏移溢出而被连累成非有限值。平移量本
+// 身（目标与锚点之差）溢出属于真正改变位置且结果无法表示的校正，该轴
+// 不置 fix 位、平移量非有限，仍按既有数值异常规则拒绝。
 func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 	heading := normalizeAngle(tgt.Heading)
 	dHeading := normalizeAngle(heading - anchorBefore.Heading)
@@ -42,6 +52,8 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 		cosD:          math.Cos(dHeading),
 		sinD:          math.Sin(dHeading),
 		identity:      dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
+		fixX:          dHeading == 0 && tgt.X == anchorBefore.X,
+		fixY:          dHeading == 0 && tgt.Y == anchorBefore.Y,
 	}
 }
 
@@ -59,6 +71,29 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	if s.identity {
 		return before.X, before.Y, before.Heading
+	}
+	if s.dHeading == 0 {
+		// 纯平移：锚点之后各帧只是整体加上同一平移量。平移量为零的轴
+		// 直接保留该帧原坐标，不先求相对锚点偏移——另一轴的大跨度平
+		// 移可能让本轴“相对锚点”在数值上溢出（例如本轴坐标在锚点两
+		// 侧横跨 ±1e308，尽管该轴根本没动），连累本应不变的坐标变成
+		// 非有限值。平移量非零的轴仍严格按“先求 before-anchor、再加
+		// 目标”的原次序计算，使远端帧真正溢出时得到非有限值，由调用
+		// 方按既有数值异常规则拒绝；两轴各自独立计算，不把一轴的溢出
+		// 经交叉项带进另一轴。
+		if s.fixX {
+			x = before.X
+		} else {
+			dx := before.X - s.anchorX
+			x = s.x + dx
+		}
+		if s.fixY {
+			y = before.Y
+		} else {
+			dy := before.Y - s.anchorY
+			y = s.y + dy
+		}
+		return x, y, normalizeAngle(s.heading + (before.Heading - s.anchorHeading))
 	}
 	dx := before.X - s.anchorX
 	dy := before.Y - s.anchorY
