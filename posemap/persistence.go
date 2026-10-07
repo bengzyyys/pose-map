@@ -979,6 +979,50 @@ func validateLoaded(fd *fileData) error {
 			return fmt.Errorf("%w: correction %s is the last correction covering frame time %d but saved variance %v does not match its corrected variance %v", ErrCorrupt, cr.ID, got.Time, got.Variance, want.Variance)
 		}
 	}
+	// 未被任何回环校正覆盖帧的方差累计核对：被校正覆盖的帧已在上方按最后
+	// 一条覆盖记录的校正后方差逐一核对；没有任何校正记录覆盖的已导入帧，
+	// 其保存方差必须仍满足导入时的累计规则——以时间上紧邻的前一份保存位
+	// 姿的方差为基准，加上进入本帧时的原运动方差。轨迹上的前一份位姿可能
+	// 是初始位姿、另一帧未校正帧，也可能是某个校正范围的最后一帧；校正
+	// 结束后新追加、未被覆盖的帧因此自然从前一帧当前保存的校正后方差继续
+	// 累计，不使用校正前的方差或段首次导入结果里的旧方差。每一帧逐一核
+	// 对：即使文件长度、校验和与段末结果都合法，只有锚点/末帧正确而中间
+	// 一帧方差与累计矛盾也按损坏拒绝；不能因该帧没有路标观测、不是轨迹段
+	// 的末帧而跳过，也与路标合并距离无关。
+	//
+	// 检查范围只含在当前轨迹中保留逐帧来源（sources 中非 null）、且没有
+	// 被任何校正记录覆盖的已导入帧：被覆盖的帧继续沿用上方校正记录的核对
+	// 规则，不能用相邻帧相加替代校正目标；纯旧文件缺省 sources、或某帧来
+	// 源缺失（null 旧帧）时保留既有兼容行为，不猜测未知的运动方差——累计
+	// 链在该帧处断开，其之后追加且来源完整的帧仍以相邻的当前保存值为基准
+	// 接受本项检查。运动方差为零是合法情况；参与累计的前一份保存方差或运
+	// 动方差为负或不是有限数值、或累计结果超出有限数值范围，都按损坏拒绝
+	// 整份文件，并指出出错帧的时间。
+	if len(fd.Sources) != 0 {
+		for j := 1; j < len(fd.Trajectory); j++ {
+			if lastByFrame[j] >= 0 || fd.Sources[j-1] == nil {
+				// 被某条校正记录覆盖的帧由上方校正规则核对；null 旧帧没有
+				// 逐帧依据，按兼容规则跳过。
+				continue
+			}
+			t := fd.Trajectory[j].Time
+			base := fd.Trajectory[j-1].Variance
+			mv := fd.Sources[j-1].MoveVariance
+			if !isFinite(base) || base < 0 {
+				return fmt.Errorf("%w: frame at time %d accumulates on a previous saved variance %v that is negative or non-finite", ErrCorrupt, t, base)
+			}
+			if !isFinite(mv) || mv < 0 {
+				return fmt.Errorf("%w: frame at time %d has a negative or non-finite motion variance %v", ErrCorrupt, t, mv)
+			}
+			accum := base + mv
+			if !isFinite(accum) {
+				return fmt.Errorf("%w: saved variance accumulated into frame at time %d overflows the finite value range", ErrCorrupt, t)
+			}
+			if got := fd.Trajectory[j].Variance; got != accum {
+				return fmt.Errorf("%w: frame at time %d saves variance %v but the previous saved variance %v plus its motion variance %v accumulate to %v", ErrCorrupt, t, got, base, mv, accum)
+			}
+		}
+	}
 	// 段首次导入结果核对：重复导入原段时直接返回保存的首次结果，因此保存
 	// 的末位姿必须确实就是该段首次成功导入时的末位姿，不能被写成与历史
 	// 轨迹不符的值。末位姿时间必须准确命中一个已导入帧：trajectory[0]
