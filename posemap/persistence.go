@@ -1075,6 +1075,7 @@ func validateLoaded(fd *fileData) error {
 		}
 		invalIDs[iv.ID] = struct{}{}
 		lmSeen := make(map[string]struct{}, len(iv.Landmarks))
+		ids := make([]string, 0, len(iv.Landmarks))
 		for _, l := range iv.Landmarks {
 			if l.ID == "" || l.Occurrence < 1 {
 				return fmt.Errorf("%w: invalid invalidation landmark entry", ErrCorrupt)
@@ -1083,6 +1084,20 @@ func validateLoaded(fd *fileData) error {
 				return fmt.Errorf("%w: invalidation %s lists %s twice", ErrCorrupt, iv.ID, l.ID)
 			}
 			lmSeen[l.ID] = struct{}{}
+			ids = append(ids, l.ID)
+		}
+		// 集合指纹核对：记录保存的指纹必须就是对本记录实际列出的路标标识
+		// 集合计算的指纹（与 Invalidate 提交时同一集合语义，见
+		// invalidation.go 的 landmarkSetHash；出现编号、当前位置与当前有效
+		// 状态都不算集合内容）。失效结果指向、失效时间与原因都和出现历史
+		// 一致、但指纹实际属于另一组路标时，重复提交判定会被错误内容劫
+		// 持：按记录列出的集合原样重提交会被误报为内容冲突，改交指纹对应
+		// 的另一组路标反而会拿到本操作的成功结果。只要一条记录的指纹与其
+		// 列出的标识集合不一致，即使其余校验全部通过，也按损坏拒绝整份文
+		// 件。该核对只依据失效记录自身，不依赖逐帧观测来源：没有来源的旧
+		// 地图后来追加的失效记录同样核对，不跳过。
+		if landmarkSetHash(ids) != iv.Hash {
+			return fmt.Errorf("%w: invalidation %s records a landmark set hash that does not match its listed landmarks", ErrCorrupt, iv.ID)
 		}
 		// 交叉核对：成功失效结果里的每个（路标标识，出现编号）必须准确
 		// 指向该路标历史中同编号的那次出现，不能改指同一路标的其他出现，
