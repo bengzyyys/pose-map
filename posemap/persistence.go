@@ -1084,6 +1084,21 @@ func validateLoaded(fd *fileData) error {
 			}
 			lmSeen[l.ID] = struct{}{}
 		}
+		// 集合指纹核对：记录保存的指纹必须确实是其失效结果里实际列出的路标
+		// 标识集合的指纹（规则与提交时的重复判定相同，见 landmarkSetHash，
+		// 与输入次序无关；重复条目已在上方拒绝）。指纹属于另一组路标时，即
+		// 使字节校验、路标位置、出现编号以及各次失效的时间/原因/操作标识都
+		// 相互对应，重新打开后重复提交原请求会被误报为内容冲突，而按指纹对
+		// 应的另一组路标提交又会冒领本操作的首次成功结果——因此只要有一条
+		// 记录不一致就按损坏拒绝整份文件，错误说明带该失效操作标识；删掉本
+		// 记录或改动结果条目来消除矛盾会在下方的正/反向核对中被拒绝。
+		listedIDs := make([]string, len(iv.Landmarks))
+		for i, l := range iv.Landmarks {
+			listedIDs[i] = l.ID
+		}
+		if wantHash := landmarkSetHash(listedIDs); iv.Hash != wantHash {
+			return fmt.Errorf("%w: invalidation %s saves landmark set fingerprint %s but its result lists %d landmarks whose set fingerprint is %s", ErrCorrupt, iv.ID, iv.Hash, len(listedIDs), wantHash)
+		}
 		// 交叉核对：成功失效结果里的每个（路标标识，出现编号）必须准确
 		// 指向该路标历史中同编号的那次出现，不能改指同一路标的其他出现，
 		// 也不能因为路标后来再次出现就把旧结果指向最新记录。被指出现必须
