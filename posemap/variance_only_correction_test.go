@@ -196,9 +196,10 @@ func TestCorrectionVarianceOnlyRecord(t *testing.T) {
 	}
 }
 
-// 恒等校正只放宽“几何相同但相对偏移计算溢出”这一种误拒绝；其余拒绝规则不变：
-// 负方差、非有限目标、有限目标但累计后非有限（标明锚点时间）、真正改变位置
-// 或朝向的校正保留原有 non_finite 行为。任何拒绝不留部分更新。
+// 恒等校正与纯平移校正只放宽“相对锚点偏移计算溢出、但校正后坐标实际有限”
+// 这一种误拒绝；其余拒绝规则不变：负方差、非有限目标、有限目标但累计后非有
+// 限（标明锚点时间）、旋转横跨大坐标、或校正后位置确实溢出的平移，都保留原
+// 有 non_finite 行为。任何拒绝不留部分更新。
 func TestCorrectionVarianceOnlyRejections(t *testing.T) {
 	build := func(t *testing.T, merge float64) *Map {
 		m := newMap(t, Config{
@@ -289,10 +290,10 @@ func TestCorrectionVarianceOnlyRejections(t *testing.T) {
 
 	t.Run("position change keeps arithmetic rejection", func(t *testing.T) {
 		m := build(t, 10)
-		// 朝向不变但位置确实改变：1e308 量级下 ULP 约 1.6e292，+1 会被舍掉
-		// （数值上仍是同一锚点位姿），取可分辨的 1e293；远端帧相对偏移仍溢出。
+		// 朝向不变、纯平移，但校正后位置确实溢出：锚点从 -1e308 平移到 0
+		// （平移量 1e308 有限），末帧 1e308 + 1e308 超出可表示范围。
 		_, err := m.Correct(Correction{ID: "x", Anchor: 100,
-			Target: CorrectionTarget{X: -1e308 + 1e293, Variance: 4}})
+			Target: CorrectionTarget{X: 0, Variance: 4}})
 		r, ok := AsRejectError(err)
 		if !ok || r.Kind != RejectNonFinite || !r.HasTime || r.Time != 100 {
 			t.Fatalf("err = %v, want non_finite at anchor 100 for position change", err)

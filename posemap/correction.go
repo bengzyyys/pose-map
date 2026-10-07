@@ -18,6 +18,7 @@ type poseShift struct {
 	anchorHeading float64 // 锚点校正前朝向
 	dHeading      float64 // 归一后的最短朝向差，即各帧叠加的旋转角
 	cosD, sinD    float64 // 旋转角的余弦与正弦
+	tx, ty        float64 // 纯平移校正（旋转角为 0）时各轴的平移量
 	identity      bool    // 只调方差的恒等校正：位置与朝向保持原值
 }
 
@@ -27,7 +28,9 @@ type poseShift struct {
 // 转，校正前后位姿必须完全相同。恒等校正不能套用旋转平移公式——公式会
 // 先求相对锚点的偏移，轨迹横跨 ±1e308 这类大坐标时该差值先溢出为
 // ±Inf、再参与浮点运算退化为 NaN，使本应成功的校正被误判为数值异常；
-// 恒等校正直接保留原位姿。
+// 恒等校正直接保留原位姿。纯平移校正（旋转角为 0 但位置有移动）同理不
+// 能套用该公式：它按“各轴平移量 = 目标轴坐标 − 锚点原轴坐标”逐轴平移，
+// 只要各轴平移量与校正后坐标有限，轨迹横跨多大坐标都不会凭空溢出。
 func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 	heading := normalizeAngle(tgt.Heading)
 	dHeading := normalizeAngle(heading - anchorBefore.Heading)
@@ -41,13 +44,23 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 		dHeading:      dHeading,
 		cosD:          math.Cos(dHeading),
 		sinD:          math.Sin(dHeading),
+		tx:            tgt.X - anchorBefore.X,
+		ty:            tgt.Y - anchorBefore.Y,
 		identity:      dHeading == 0 && tgt.X == anchorBefore.X && tgt.Y == anchorBefore.Y,
 	}
 }
 
-// apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；否则把校
-// 正前相对锚点的偏移随锚点一起旋转平移，朝向叠加同一旋转角并归一到
-// [-π,π)。帧时间与方差不属于几何规则，由调用方处理。
+// apply 计算一帧校正后的位置与朝向：恒等校正原样保留校正前值；纯平移校
+// 正（旋转角为 0）按各轴平移量逐轴平移；其余情形把校正前相对锚点的偏移
+// 随锚点一起旋转平移，朝向叠加同一旋转角并归一到 [-π,π)。帧时间与方差
+// 不属于几何规则，由调用方处理。
+//
+// 纯平移不套用“先求相对锚点偏移再加回目标位置”的通用公式：锚点与某帧
+// 分处很大的正、负坐标时（如 ±1e308），该偏移先溢出为 ±Inf，即使两轴
+// 平移量与校正后坐标都有限也会被误判为数值异常。逐轴平移时，某轴平移量
+// 为零则该轴坐标原样保留（连 -0 也不会被写成 +0），另一轴的平移不影响
+// 它；某轴平移量本身溢出为无穷时，校正后坐标随之非有限，仍由调用方按既
+// 有数值异常规则整次拒绝。
 //
 // 朝向按“目标朝向 + 该校正前相对锚点的朝向差”计算，而不是“校正前朝向 +
 // 旋转角”：二者在数学上（模 2π）等价，但后者先把目标朝向与锚点朝向相减
@@ -59,6 +72,24 @@ func newPoseShift(tgt CorrectionTarget, anchorBefore Pose) poseShift {
 func (s poseShift) apply(before Pose) (x, y, heading float64) {
 	if s.identity {
 		return before.X, before.Y, before.Heading
+	}
+	if s.dHeading == 0 {
+		// 纯平移：逐轴平移，不经过相对锚点的偏移（见大段注释）。与锚点
+		// 原轴坐标相同的帧（含锚点自身）直接取目标轴坐标：锚点必须准确
+		// 采用提交目标，且校正前同轴坐标相同的帧校正后也必须相同，不能
+		// 因“先减后加”的末位舍入彼此偏离。
+		x, y = before.X, before.Y
+		if before.X == s.anchorX {
+			x = s.x
+		} else if s.tx != 0 {
+			x = before.X + s.tx
+		}
+		if before.Y == s.anchorY {
+			y = s.y
+		} else if s.ty != 0 {
+			y = before.Y + s.ty
+		}
+		return x, y, normalizeAngle(s.heading + (before.Heading - s.anchorHeading))
 	}
 	dx := before.X - s.anchorX
 	dy := before.Y - s.anchorY
